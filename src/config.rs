@@ -1,0 +1,518 @@
+//! Configuration model.
+//!
+//! There are two layers of configuration:
+//!
+//! * [`Bootstrap`] — the tiny, unavoidable local file (`/etc/homeops/bootstrap.toml`)
+//!   that only tells the server where the infra repo lives.
+//! * [`Config`] — the full desired state, read from `homeops.yaml` inside the infra repo.
+//!   Git is the source of truth; everything operational comes from here.
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// Default working directory for state, checkouts and backups.
+pub const DEFAULT_WORKDIR: &str = "/var/lib/homeops";
+/// Default location of the local bootstrap file.
+pub const DEFAULT_BOOTSTRAP_PATH: &str = "/etc/homeops/bootstrap.toml";
+/// Lowest port HomeOps will allocate for app upstreams.
+pub const PORT_RANGE_START: u16 = 41000;
+/// Highest port HomeOps will allocate for app upstreams.
+pub const PORT_RANGE_END: u16 = 41999;
+/// Docker network all managed containers join so they can reach each other by name.
+pub const DOCKER_NETWORK: &str = "homeops";
+/// Marker that must be present before HomeOps overwrites a full Caddyfile.
+pub const CADDY_OWNERSHIP_MARKER: &str = "# managed-by: homeops";
+
+// ---------------------------------------------------------------------------
+// Bootstrap (local)
+// ---------------------------------------------------------------------------
+
+/// The only configuration that must live on the machine itself.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Bootstrap {
+    /// Git URL of the private infra repo.
+    pub infra_repo: String,
+    /// Branch/tag/commit of the infra repo to track.
+    #[serde(default = "default_infra_ref")]
+    pub infra_ref: String,
+    /// Local working directory.
+    #[serde(default = "default_workdir")]
+    pub workdir: String,
+}
+
+fn default_infra_ref() -> String {
+    "main".to_string()
+}
+fn default_workdir() -> String {
+    DEFAULT_WORKDIR.to_string()
+}
+
+impl Bootstrap {
+    pub fn load(path: &Path) -> Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading bootstrap file {}", path.display()))?;
+        let cfg: Bootstrap =
+            toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        Ok(cfg)
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let raw = toml::to_string_pretty(self)?;
+        std::fs::write(path, raw)
+            .with_context(|| format!("writing bootstrap file {}", path.display()))?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resolved local directory layout
+// ---------------------------------------------------------------------------
+
+/// Concrete paths derived from the working directory.
+#[derive(Debug, Clone)]
+pub struct Paths {
+    pub workdir: PathBuf,
+    pub infra: PathBuf,
+    pub checkouts: PathBuf,
+    pub state: PathBuf,
+    pub backups: PathBuf,
+    pub run: PathBuf,
+    pub install_manifest: PathBuf,
+}
+
+impl Paths {
+    pub fn new(workdir: impl Into<PathBuf>) -> Self {
+        let workdir = workdir.into();
+        Paths {
+            infra: workdir.join("infra"),
+            checkouts: workdir.join("checkouts"),
+            state: workdir.join("state"),
+            backups: workdir.join("backups"),
+            run: PathBuf::from("/run/homeops"),
+            install_manifest: workdir.join("install-manifest.json"),
+            workdir,
+        }
+    }
+
+    /// Path to `homeops.yaml` inside the infra checkout.
+    pub fn config_file(&self) -> PathBuf {
+        self.infra.join("homeops.yaml")
+    }
+
+    pub fn checkout(&self, app: &str) -> PathBuf {
+        self.checkouts.join(app)
+    }
+
+    pub fn state_file(&self, app: &str) -> PathBuf {
+        self.state.join(format!("{app}.json"))
+    }
+
+    pub fn events_file(&self, app: &str) -> PathBuf {
+        self.state.join(format!("{app}.events.log"))
+    }
+
+    pub fn lock_file(&self) -> PathBuf {
+        self.run.join("reconcile.lock")
+    }
+
+    /// Create every directory HomeOps expects to exist.
+    pub fn ensure_dirs(&self) -> Result<()> {
+        for dir in [
+            &self.workdir,
+            &self.infra,
+            &self.checkouts,
+            &self.state,
+            &self.backups,
+            &self.backups.join("postgres"),
+            &self.backups.join("mysql"),
+            &self.run,
+        ] {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("creating directory {}", dir.display()))?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Config (homeops.yaml)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Config {
+    #[serde(default)]
+    pub server: ServerConfig,
+    #[serde(default)]
+    pub admin: AdminConfig,
+    #[serde(default)]
+    pub reconcile: ReconcileConfig,
+    #[serde(default)]
+    pub proxy: ProxyConfig,
+    #[serde(default)]
+    pub backups: BackupConfig,
+    #[serde(default)]
+    pub databases: DatabasesConfig,
+    #[serde(default)]
+    pub caddy: CaddyConfig,
+    #[serde(default)]
+    pub apps: BTreeMap<String, AppConfig>,
+}
+
+impl Config {
+    pub fn load(path: &Path) -> Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading config {}", path.display()))?;
+        let cfg: Config =
+            serde_yaml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Reject configurations that would route the same domain to two places.
+    pub fn validate(&self) -> Result<()> {
+        let mut seen: BTreeMap<String, String> = BTreeMap::new();
+        let admin_domain = self.proxy.admin_domain.as_ref().map(|d| d.to_lowercase());
+        if let Some(d) = &admin_domain {
+            seen.insert(d.clone(), "<admin>".to_string());
+        }
+        for (name, app) in &self.apps {
+            for domain in &app.domains {
+                let key = domain.to_lowercase();
+                if let Some(prev) = seen.get(&key) {
+                    anyhow::bail!("domain `{domain}` is claimed by both `{prev}` and `{name}`");
+                }
+                seen.insert(key, name.clone());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ServerConfig {
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AdminConfig {
+    /// Address the admin UI listens on, e.g. `127.0.0.1:9090`.
+    #[serde(default = "default_admin_bind")]
+    pub bind: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Alternative to username/password: a static bearer token.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+fn default_admin_bind() -> String {
+    "127.0.0.1:9090".to_string()
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        AdminConfig {
+            bind: default_admin_bind(),
+            username: None,
+            password: None,
+            auth_token: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReconcileConfig {
+    /// Reconcile interval as a systemd-style duration, e.g. `2m`.
+    #[serde(default = "default_interval")]
+    pub interval: String,
+}
+
+fn default_interval() -> String {
+    "2m".to_string()
+}
+
+impl Default for ReconcileConfig {
+    fn default() -> Self {
+        ReconcileConfig {
+            interval: default_interval(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProxyConfig {
+    /// `homeops` (built-in proxy) is the only supported mode in v1.
+    #[serde(default = "default_proxy_mode")]
+    pub mode: String,
+    #[serde(default = "default_proxy_listen")]
+    pub listen: String,
+    /// Domain that routes to the admin UI.
+    #[serde(default)]
+    pub admin_domain: Option<String>,
+    /// Max request body size in bytes (0 = unlimited).
+    #[serde(default)]
+    pub max_body_bytes: u64,
+}
+
+fn default_proxy_mode() -> String {
+    "homeops".to_string()
+}
+fn default_proxy_listen() -> String {
+    "0.0.0.0:80".to_string()
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        ProxyConfig {
+            mode: default_proxy_mode(),
+            listen: default_proxy_listen(),
+            admin_domain: None,
+            max_body_bytes: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct BackupConfig {
+    #[serde(default)]
+    pub target: BackupTarget,
+    #[serde(default)]
+    pub retention: Option<u32>,
+    #[serde(default)]
+    pub compression: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum BackupTarget {
+    Local {
+        #[serde(default = "default_backup_path")]
+        path: String,
+    },
+    Ssh {
+        host: String,
+        user: String,
+        path: String,
+    },
+    S3 {
+        bucket: String,
+        endpoint: Option<String>,
+        access_key: Option<String>,
+        secret_key: Option<String>,
+    },
+}
+
+fn default_backup_path() -> String {
+    format!("{DEFAULT_WORKDIR}/backups")
+}
+
+impl Default for BackupTarget {
+    fn default() -> Self {
+        BackupTarget::Local {
+            path: default_backup_path(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct DatabasesConfig {
+    #[serde(default)]
+    pub postgres: Option<EngineConfig>,
+    #[serde(default)]
+    pub mysql: Option<EngineConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EngineConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub version: String,
+    #[serde(default = "default_admin_user")]
+    pub admin_user: String,
+    pub admin_password: String,
+}
+
+fn default_admin_user() -> String {
+    "admin".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CaddyConfig {
+    /// `off` (default), `fragment`, or `full`.
+    #[serde(default = "default_caddy_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub output: Option<String>,
+}
+
+fn default_caddy_mode() -> String {
+    "off".to_string()
+}
+
+impl Default for CaddyConfig {
+    fn default() -> Self {
+        CaddyConfig {
+            mode: default_caddy_mode(),
+            output: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// App config
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AppConfig {
+    /// Git URL of the app repo.
+    pub repo: String,
+    /// Branch, tag, or commit.
+    #[serde(default = "default_app_ref")]
+    pub r#ref: String,
+    /// Optional explicit tracking mode: `branch` or `fixed`. Inferred when absent.
+    #[serde(default)]
+    pub tracking: Option<String>,
+    /// Domains routed to this app.
+    #[serde(default)]
+    pub domains: Vec<String>,
+    /// Port the app listens on inside the container.
+    #[serde(default = "default_app_port")]
+    pub port: u16,
+    /// Env file inside the infra repo, e.g. `env/site.env`.
+    #[serde(default)]
+    pub env_file: Option<String>,
+    /// Managed databases used by this app.
+    #[serde(default)]
+    pub databases: AppDatabases,
+    /// Optional HTTP healthcheck.
+    #[serde(default)]
+    pub healthcheck: Option<Healthcheck>,
+}
+
+fn default_app_ref() -> String {
+    "main".to_string()
+}
+fn default_app_port() -> u16 {
+    3000
+}
+
+impl AppConfig {
+    /// Whether HomeOps should follow new commits on the ref.
+    pub fn tracks_branch(&self) -> bool {
+        match self.tracking.as_deref() {
+            Some("branch") => true,
+            Some("fixed") => false,
+            _ => {
+                // Infer: a 40-char hex string is a commit (fixed); a name that
+                // looks like a version tag is fixed; anything else is a branch.
+                let r = &self.r#ref;
+                let is_sha =
+                    r.len() >= 7 && r.len() <= 40 && r.chars().all(|c| c.is_ascii_hexdigit());
+                let is_tag =
+                    r.starts_with('v') && r[1..].chars().next().is_some_and(|c| c.is_ascii_digit());
+                !(is_sha || is_tag)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct AppDatabases {
+    #[serde(default)]
+    pub postgres: Option<AppDatabase>,
+    #[serde(default)]
+    pub mysql: Option<AppDatabase>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AppDatabase {
+    pub database: String,
+    /// Env var the connection string is injected as (e.g. `DATABASE_URL`).
+    pub env_var: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Healthcheck {
+    pub path: String,
+    #[serde(default = "default_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_hc_interval")]
+    pub interval_seconds: u64,
+    #[serde(default = "default_retries")]
+    pub retries: u32,
+}
+
+fn default_timeout() -> u64 {
+    10
+}
+fn default_hc_interval() -> u64 {
+    5
+}
+fn default_retries() -> u32 {
+    5
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(yaml: &str) -> AppConfig {
+        serde_yaml::from_str(yaml).expect("valid app config")
+    }
+
+    #[test]
+    fn branch_ref_is_tracked() {
+        assert!(app("repo: x\nref: main").tracks_branch());
+        assert!(app("repo: x\nref: develop").tracks_branch());
+    }
+
+    #[test]
+    fn commit_and_tag_refs_are_fixed() {
+        assert!(!app("repo: x\nref: a1b2c3d4e5f6").tracks_branch());
+        assert!(!app("repo: x\nref: v1.2.3").tracks_branch());
+    }
+
+    #[test]
+    fn explicit_tracking_overrides_inference() {
+        assert!(app("repo: x\nref: v1.2.3\ntracking: branch").tracks_branch());
+        assert!(!app("repo: x\nref: main\ntracking: fixed").tracks_branch());
+    }
+
+    #[test]
+    fn duplicate_domain_is_rejected() {
+        let cfg: Config = serde_yaml::from_str(
+            "apps:\n  a:\n    repo: x\n    domains: [dup.example.com]\n\
+             \n  b:\n    repo: y\n    domains: [dup.example.com]\n",
+        )
+        .unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn admin_domain_conflict_is_rejected() {
+        let cfg: Config = serde_yaml::from_str(
+            "proxy:\n  admin_domain: ops.example.com\n\
+             apps:\n  a:\n    repo: x\n    domains: [ops.example.com]\n",
+        )
+        .unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn unique_domains_are_accepted() {
+        let cfg: Config = serde_yaml::from_str(
+            "apps:\n  a:\n    repo: x\n    domains: [a.example.com]\n\
+             \n  b:\n    repo: y\n    domains: [b.example.com]\n",
+        )
+        .unwrap();
+        assert!(cfg.validate().is_ok());
+    }
+}
