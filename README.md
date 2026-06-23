@@ -46,9 +46,9 @@ fits better.
 
 There are two kinds of repository:
 
-- **Infra repo** (private): the server's configuration — `homeops.yaml` plus env
-  files. May contain secrets in plaintext if you accept that trade-off; the
-  private repo effectively becomes the server's master key.
+- **Infra repo** (private): the server's configuration — a single `homeops.ncl`
+  (Nickel), with env vars declared inline. May contain secrets in plaintext if you
+  accept that trade-off; the private repo effectively becomes the server's master key.
 - **App repos** (public or private): just application code. Each must have a
   `Dockerfile` at the root and must not declare any infrastructure.
 
@@ -104,58 +104,59 @@ infra_ref  = "main"
 workdir    = "/var/lib/homeops"
 ```
 
-### Infra repo (`homeops.yaml`)
+### Infra repo (`homeops.ncl`)
 
-Everything else lives in Git. See [`examples/homeops.yaml`](examples/homeops.yaml)
-for a complete example. In short:
+Everything else lives in Git, written in [Nickel](https://nickel-lang.org). HomeOps
+embeds the Nickel evaluator (the `nickel-lang-core` crate) and reads the config
+in-process — no external binary required on the server. See
+[`examples/homeops.ncl`](examples/homeops.ncl) for a complete example. In short:
 
-```yaml
-server:
-  name: vps-01
+```nickel
+# Shared defaults; `| default` lets each app override without a merge conflict.
+let webapp = fun cfg => { port | default = 3000 } & cfg in
 
-admin:
-  bind: "127.0.0.1:9090"
-  username: admin
-  password: "change-me"          # plaintext is accepted; the repo is private
+{
+  server.name = "vps-01",
 
-reconcile:
-  interval: "2m"
+  admin = { bind = "127.0.0.1:9090", username = "admin", password = "change-me" },
 
-proxy:
-  listen: "0.0.0.0:80"
-  admin_domain: "ops.example.com"
+  reconcile.interval = "2m",
 
-databases:
-  postgres:
-    enabled: true
-    version: "16"
-    admin_user: admin
-    admin_password: "postgres-password"
+  proxy = { listen = "0.0.0.0:80", admin_domain = "ops.example.com" },
 
-apps:
-  site:
-    repo: git@github.com:you/site.git
-    ref: main
-    domains: [example.com, www.example.com]
-    port: 3000
-    env_file: env/site.env
+  databases = {
+    postgres = { enabled = true, version = "16", admin_user = "admin", admin_password = "postgres-password" },
+  },
 
-  api:
-    repo: git@github.com:you/api.git
-    ref: main
-    domains: [api.example.com]
-    port: 3000
-    env_file: env/api.env
-    databases:
-      postgres:
-        database: api
-        env_var: DATABASE_URL
-    healthcheck:
-      path: /health
-      timeout_seconds: 10
-      interval_seconds: 5
-      retries: 5
+  apps = {
+    site = webapp {
+      repo = "git@github.com:you/site.git",
+      # ref omitted → convention: track `master` if it exists, else `main`.
+      domains = ["example.com", "www.example.com"],
+      env = { NODE_ENV = "production" },   # env vars live inline — no separate files
+      pass = "tomate1234",                 # optional basic auth; username defaults to `admin`
+    },
+
+    api = webapp {
+      repo = "git@github.com:you/api.git",
+      ref = "main",
+      domains = ["api.example.com"],
+      env = { LOG_LEVEL = "info" },
+      databases = { postgres = { database = "api", env_var = "DATABASE_URL" } },
+      healthcheck = { path = "/health", timeout_seconds = 10, interval_seconds = 5, retries = 5 },
+    },
+  },
+}
 ```
+
+**Branch convention.** An app's `ref` is optional. Omit it and HomeOps tracks
+`master` if the repo has it, otherwise `main`, otherwise it aborts with a clear
+error. Set `ref` explicitly to pin a tag or commit.
+
+**Per-app basic auth.** Add `pass: <plaintext>` to an app to put its domains
+behind HTTP basic auth at the proxy. The username defaults to `admin`; override
+it with `user:`. No-frills and plaintext, like the rest of the config — the
+infra repo is private.
 
 ## How it works
 
@@ -163,9 +164,10 @@ apps:
   (deployed commit, config hash, image, assigned port). It exists so reconcile can
   skip unnecessary rebuilds and so rollback has something to fall back to.
 - **Reconcile.** For each app: sync the repo, resolve the commit, hash the
-  config + env file, and — only if something changed — rebuild the image, start a
-  new container, run the healthcheck, and roll back to the previous image if it
-  fails. A lock (`/run/homeops/reconcile.lock`) prevents concurrent runs.
+  config (env vars included, since they live inline), and — only if something
+  changed — rebuild the image, start a new container, run the healthcheck, and roll
+  back to the previous image if it fails. A lock (`/run/homeops/reconcile.lock`)
+  prevents concurrent runs.
 - **Proxy.** Apps bind to `127.0.0.1` on a port in the `41000–41999` range. The
   built-in proxy routes by normalized `Host` header, sets `X-Forwarded-*`,
   streams bodies and tunnels WebSocket upgrades. TLS is expected to be terminated

@@ -7,7 +7,7 @@
 //! * the **admin UI** (e.g. `127.0.0.1:9090`), which shows status and exposes a
 //!   few operational actions (deploy now, backup now).
 
-use crate::config::{AdminConfig, Config, Paths};
+use crate::config::{AdminConfig, AppConfig, Config, Paths};
 use crate::state::{self, AppState};
 use crate::{backup, docker, reconcile};
 use anyhow::{Context, Result};
@@ -123,16 +123,31 @@ fn normalize_host(req: &Request<Incoming>) -> Option<String> {
     Some(host.to_ascii_lowercase())
 }
 
-/// Find the upstream port for a host by matching app domains and reading state.
-fn resolve_app_port(ctx: &Ctx, host: &str) -> Option<u16> {
-    for (name, app) in &ctx.config.apps {
-        if app.domains.iter().any(|d| d.eq_ignore_ascii_case(host)) {
-            return AppState::load(&ctx.paths, name)
-                .ok()
-                .and_then(|s| s.current_port);
-        }
+/// Find the app whose domains include `host`.
+fn resolve_app<'a>(ctx: &'a Ctx, host: &str) -> Option<(&'a String, &'a AppConfig)> {
+    ctx.config
+        .apps
+        .iter()
+        .find(|(_, app)| app.domains.iter().any(|d| d.eq_ignore_ascii_case(host)))
+}
+
+/// Check HTTP basic-auth credentials against a plaintext `user`/`pass`.
+fn basic_auth_ok(req: &Request<Incoming>, user: &str, pass: &str) -> bool {
+    let expected = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+    req.headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == format!("Basic {expected}"))
+        .unwrap_or(false)
+}
+
+/// 401 challenge for an app domain guarded by basic auth.
+fn auth_challenge(realm: &str) -> Response<ResBody> {
+    let mut resp = status(StatusCode::UNAUTHORIZED, "authentication required");
+    if let Ok(v) = HeaderValue::from_str(&format!("Basic realm=\"{realm}\"")) {
+        resp.headers_mut().insert(header::WWW_AUTHENTICATE, v);
     }
-    None
+    resp
 }
 
 async fn handle_proxy(
@@ -144,11 +159,27 @@ async fn handle_proxy(
         return Ok(status(StatusCode::BAD_REQUEST, "missing Host header"));
     };
 
-    // Admin domain → admin listener.
+    // Admin domain → admin listener (the admin UI enforces its own auth).
     let upstream = if ctx.admin_domain.as_deref() == Some(host.as_str()) {
         ctx.admin_upstream.clone()
     } else {
-        match resolve_app_port(&ctx, &host) {
+        let Some((name, app)) = resolve_app(&ctx, &host) else {
+            return Ok(status(
+                StatusCode::NOT_FOUND,
+                &format!("no app routed for host `{host}`"),
+            ));
+        };
+        // Gate the app behind basic auth when a password is configured. Done
+        // before any upgrade handling so websockets are protected too.
+        if let Some((user, pass)) = app.basic_auth() {
+            if !basic_auth_ok(&req, &user, &pass) {
+                return Ok(auth_challenge(&host));
+            }
+        }
+        match AppState::load(&ctx.paths, name)
+            .ok()
+            .and_then(|s| s.current_port)
+        {
             Some(port) => format!("127.0.0.1:{port}"),
             None => {
                 return Ok(status(

@@ -1,4 +1,4 @@
-//! The core convergence loop: make the running server match `homeops.yaml`.
+//! The core convergence loop: make the running server match `homeops.ncl`.
 
 use crate::config::{AppConfig, Config, Paths, DOCKER_NETWORK};
 use crate::state::{self, AppState};
@@ -7,7 +7,6 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
 use std::time::Duration;
 
 /// What reconcile would (or did) do for a single app.
@@ -31,20 +30,11 @@ impl std::fmt::Display for Action {
 }
 
 /// Hash that captures everything that should trigger a redeploy when changed:
-/// the app's resolved config plus the contents of its env file.
-fn config_hash(paths: &Paths, app: &AppConfig) -> String {
+/// the app's resolved config, env vars included (they live inline now).
+fn config_hash(app: &AppConfig) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(serde_yaml::to_string(app).unwrap_or_default().as_bytes());
-    if let Some(env_file) = &app.env_file {
-        if let Ok(contents) = std::fs::read(paths.infra.join(env_file)) {
-            hasher.update(&contents);
-        }
-    }
+    hasher.update(serde_json::to_string(app).unwrap_or_default().as_bytes());
     format!("{:x}", hasher.finalize())
-}
-
-fn env_file_path(paths: &Paths, app: &AppConfig) -> Option<PathBuf> {
-    app.env_file.as_ref().map(|f| paths.infra.join(f))
 }
 
 /// Collect ports already assigned to other apps, so allocation avoids clashes.
@@ -83,14 +73,17 @@ fn reconcile_app(cfg: &Config, paths: &Paths, name: &str, app: &AppConfig) -> Re
     let mut st = AppState::load(paths, name)?;
     st.app = name.to_string();
 
-    // 1. Sync source.
+    // 1. Sync source. An app without an explicit `ref` follows the master/main
+    //    convention, resolved against the remote.
     let checkout = paths.checkout(name);
-    git::sync(&app.repo, &app.r#ref, &checkout, app.tracks_branch())
+    let git_ref = git::resolve_ref(&app.repo, app.r#ref.as_deref())
+        .with_context(|| format!("resolving ref for {name}"))?;
+    git::sync(&app.repo, &git_ref, &checkout, app.tracks_branch())
         .with_context(|| format!("syncing {name}"))?;
     let sha = git::head_commit(&checkout)?;
 
     // 2. Decide what changed.
-    let cfg_hash = config_hash(paths, app);
+    let cfg_hash = config_hash(app);
     let container = docker::container_name(name);
     let unchanged = st.last_deployed_commit.as_deref() == Some(sha.as_str())
         && st.last_config_hash.as_deref() == Some(cfg_hash.as_str())
@@ -111,8 +104,12 @@ fn reconcile_app(cfg: &Config, paths: &Paths, name: &str, app: &AppConfig) -> Re
         state::record_event(paths, name, "build ok")?;
     }
 
-    // 4. Resolve managed databases into env vars.
-    let mut env: Vec<(String, String)> = Vec::new();
+    // 4. Resolve env vars: the app's inline `env`, then managed databases on top.
+    let mut env: Vec<(String, String)> = app
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     if let Some(pg) = &app.databases.postgres {
         let url = databases::ensure_postgres_db(cfg, &pg.database)?;
         env.push((pg.env_var.clone(), url));
@@ -126,9 +123,8 @@ fn reconcile_app(cfg: &Config, paths: &Paths, name: &str, app: &AppConfig) -> Re
     let previous_image = st.last_image.clone();
     let taken = taken_ports(paths, cfg, name);
     let port = state::allocate_port(&mut st, &taken)?;
-    let env_file = env_file_path(paths, app);
 
-    start_container(&container, &image, port, app, env_file.as_deref(), &env)?;
+    start_container(&container, &image, port, app, &env)?;
 
     // 6. Healthcheck (or grace period) → rollback on failure.
     match check_health(port, app) {
@@ -149,14 +145,7 @@ fn reconcile_app(cfg: &Config, paths: &Paths, name: &str, app: &AppConfig) -> Re
         }
         Err(e) => {
             state::record_event(paths, name, &format!("healthcheck failed: {e}"))?;
-            rollback(
-                &container,
-                previous_image.as_deref(),
-                port,
-                app,
-                env_file.as_deref(),
-                &env,
-            )?;
+            rollback(&container, previous_image.as_deref(), port, app, &env)?;
             state::record_event(paths, name, "rollback done")?;
             st.last_error = Some(format!("healthcheck failed: {e}"));
             st.save(paths)?;
@@ -170,7 +159,6 @@ fn start_container(
     image: &str,
     port: u16,
     app: &AppConfig,
-    env_file: Option<&std::path::Path>,
     env: &[(String, String)],
 ) -> Result<()> {
     docker::remove(container)?;
@@ -180,7 +168,6 @@ fn start_container(
         network: DOCKER_NETWORK,
         host_port: port,
         container_port: app.port,
-        env_file,
         env: env.to_vec(),
     })
 }
@@ -191,11 +178,10 @@ fn rollback(
     previous_image: Option<&str>,
     port: u16,
     app: &AppConfig,
-    env_file: Option<&std::path::Path>,
     env: &[(String, String)],
 ) -> Result<()> {
     match previous_image {
-        Some(image) => start_container(container, image, port, app, env_file, env),
+        Some(image) => start_container(container, image, port, app, env),
         None => docker::remove(container),
     }
 }
@@ -269,8 +255,10 @@ pub struct PlanEntry {
 
 fn plan_app(paths: &Paths, name: &str, app: &AppConfig) -> PlanEntry {
     let st = AppState::load(paths, name).unwrap_or_default();
-    let remote = git::remote_commit(&app.repo, &app.r#ref);
-    let cfg_hash = config_hash(paths, app);
+    let remote = git::resolve_ref(&app.repo, app.r#ref.as_deref())
+        .ok()
+        .and_then(|r| git::remote_commit(&app.repo, &r));
+    let cfg_hash = config_hash(app);
     let config_changed = st.last_config_hash.as_deref() != Some(cfg_hash.as_str());
 
     let commit_change = match (&st.last_deployed_commit, &remote) {

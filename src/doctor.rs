@@ -82,12 +82,19 @@ pub fn run(bootstrap: Option<&Bootstrap>, cfg: Option<&Config>, paths: &Paths) -
     // App repos.
     if let Some(cfg) = cfg {
         for (name, app) in &cfg.apps {
-            let reachable = crate::git::remote_commit(&app.repo, &app.r#ref).is_some();
-            checks.push(if reachable {
-                Check::ok(&format!("app:{name}"), "repo reachable")
-            } else {
-                Check::fail(&format!("app:{name}"), format!("cannot reach {}", app.repo))
-            });
+            match crate::git::resolve_ref(&app.repo, app.r#ref.as_deref()) {
+                Ok(git_ref) if crate::git::remote_commit(&app.repo, &git_ref).is_some() => {
+                    checks.push(Check::ok(
+                        &format!("app:{name}"),
+                        format!("repo reachable ({git_ref})"),
+                    ));
+                }
+                Ok(_) => checks.push(Check::fail(
+                    &format!("app:{name}"),
+                    format!("cannot reach {}", app.repo),
+                )),
+                Err(e) => checks.push(Check::fail(&format!("app:{name}"), e.to_string())),
+            }
         }
 
         // Databases.

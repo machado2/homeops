@@ -83,7 +83,6 @@ pub struct RunSpec<'a> {
     pub network: &'a str,
     pub host_port: u16,
     pub container_port: u16,
-    pub env_file: Option<&'a Path>,
     pub env: Vec<(String, String)>,
 }
 
@@ -103,10 +102,6 @@ pub fn run_app(spec: &RunSpec) -> Result<()> {
         "-e".into(),
         format!("PORT={}", spec.container_port),
     ];
-    if let Some(env_file) = spec.env_file {
-        args.push("--env-file".into());
-        args.push(env_file.to_string_lossy().into_owned());
-    }
     for (k, v) in &spec.env {
         args.push("-e".into());
         args.push(format!("{k}={v}"));

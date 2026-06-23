@@ -152,7 +152,7 @@ async fn run() -> Result<()> {
             let (bootstrap, paths) = load_local(&cli.bootstrap)?;
             let _ = bootstrap;
             let cfg = Config::load(&paths.config_file())
-                .context("loading homeops.yaml (has the infra repo been cloned?)")?;
+                .context("loading the infra config (has the infra repo been cloned?)")?;
             serve::serve(cfg, paths).await
         }
 

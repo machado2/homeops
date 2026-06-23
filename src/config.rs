@@ -4,7 +4,7 @@
 //!
 //! * [`Bootstrap`] — the tiny, unavoidable local file (`/etc/homeops/bootstrap.toml`)
 //!   that only tells the server where the infra repo lives.
-//! * [`Config`] — the full desired state, read from `homeops.yaml` inside the infra repo.
+//! * [`Config`] — the full desired state, read from `homeops.ncl` (Nickel) inside the infra repo.
 //!   Git is the source of truth; everything operational comes from here.
 
 use anyhow::{Context, Result};
@@ -99,9 +99,9 @@ impl Paths {
         }
     }
 
-    /// Path to `homeops.yaml` inside the infra checkout.
+    /// Path to the Nickel config (`homeops.ncl`) inside the infra checkout.
     pub fn config_file(&self) -> PathBuf {
-        self.infra.join("homeops.yaml")
+        self.infra.join("homeops.ncl")
     }
 
     pub fn checkout(&self, app: &str) -> PathBuf {
@@ -140,7 +140,7 @@ impl Paths {
 }
 
 // ---------------------------------------------------------------------------
-// Config (homeops.yaml)
+// Config (homeops.ncl)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -165,10 +165,11 @@ pub struct Config {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config {}", path.display()))?;
-        let cfg: Config =
-            serde_yaml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        // Evaluate the Nickel config in-process (the `nickel-lang-core` evaluator
+        // is embedded) and deserialize straight into `Config` — no external
+        // `nickel` binary on the server.
+        let cfg: Config = nickel_lang_core::deserialize::from_path(path.to_path_buf())
+            .map_err(|e| anyhow::anyhow!("evaluating Nickel config {}: {e}", path.display()))?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -374,9 +375,10 @@ impl Default for CaddyConfig {
 pub struct AppConfig {
     /// Git URL of the app repo.
     pub repo: String,
-    /// Branch, tag, or commit.
-    #[serde(default = "default_app_ref")]
-    pub r#ref: String,
+    /// Branch, tag, or commit. Omit to follow the convention: track `master`
+    /// if the repo has it, otherwise `main`, otherwise abort.
+    #[serde(default)]
+    pub r#ref: Option<String>,
     /// Optional explicit tracking mode: `branch` or `fixed`. Inferred when absent.
     #[serde(default)]
     pub tracking: Option<String>,
@@ -386,9 +388,17 @@ pub struct AppConfig {
     /// Port the app listens on inside the container.
     #[serde(default = "default_app_port")]
     pub port: u16,
-    /// Env file inside the infra repo, e.g. `env/site.env`.
+    /// Environment variables passed to the container, declared inline.
     #[serde(default)]
-    pub env_file: Option<String>,
+    pub env: BTreeMap<String, String>,
+    /// Plaintext HTTP basic-auth password protecting this app's domains. When
+    /// set, the proxy challenges every request. No-frills: the repo is private,
+    /// so the password lives here in the clear.
+    #[serde(default)]
+    pub pass: Option<String>,
+    /// Basic-auth username. Defaults to `admin` when a `pass` is set.
+    #[serde(default)]
+    pub user: Option<String>,
     /// Managed databases used by this app.
     #[serde(default)]
     pub databases: AppDatabases,
@@ -397,9 +407,6 @@ pub struct AppConfig {
     pub healthcheck: Option<Healthcheck>,
 }
 
-fn default_app_ref() -> String {
-    "main".to_string()
-}
 fn default_app_port() -> u16 {
     3000
 }
@@ -411,9 +418,12 @@ impl AppConfig {
             Some("branch") => true,
             Some("fixed") => false,
             _ => {
+                // No explicit ref → convention resolves to master/main, both branches.
+                let Some(r) = &self.r#ref else {
+                    return true;
+                };
                 // Infer: a 40-char hex string is a commit (fixed); a name that
                 // looks like a version tag is fixed; anything else is a branch.
-                let r = &self.r#ref;
                 let is_sha =
                     r.len() >= 7 && r.len() <= 40 && r.chars().all(|c| c.is_ascii_hexdigit());
                 let is_tag =
@@ -421,6 +431,14 @@ impl AppConfig {
                 !(is_sha || is_tag)
             }
         }
+    }
+
+    /// Basic-auth credentials guarding this app's domains, if a password is set.
+    /// The username defaults to `admin` by convention.
+    pub fn basic_auth(&self) -> Option<(String, String)> {
+        let pass = self.pass.as_ref()?;
+        let user = self.user.as_deref().unwrap_or("admin");
+        Some((user.to_string(), pass.clone()))
     }
 }
 
@@ -464,55 +482,133 @@ fn default_retries() -> u32 {
 mod tests {
     use super::*;
 
-    fn app(yaml: &str) -> AppConfig {
-        serde_yaml::from_str(yaml).expect("valid app config")
+    /// Parse a single app from Nickel source.
+    fn app(src: &str) -> AppConfig {
+        nickel_lang_core::deserialize::from_str(src).expect("valid app config")
+    }
+
+    /// Parse a whole config from Nickel source.
+    fn config(src: &str) -> Config {
+        nickel_lang_core::deserialize::from_str(src).expect("valid config")
     }
 
     #[test]
     fn branch_ref_is_tracked() {
-        assert!(app("repo: x\nref: main").tracks_branch());
-        assert!(app("repo: x\nref: develop").tracks_branch());
+        assert!(app(r#"{ repo = "x", ref = "main" }"#).tracks_branch());
+        assert!(app(r#"{ repo = "x", ref = "develop" }"#).tracks_branch());
+    }
+
+    #[test]
+    fn omitted_ref_tracks_branch_by_convention() {
+        // No `ref` → resolved to master/main at sync time, always a branch.
+        let a = app(r#"{ repo = "x" }"#);
+        assert!(a.r#ref.is_none());
+        assert!(a.tracks_branch());
+    }
+
+    #[test]
+    fn pass_yields_basic_auth_with_admin_default() {
+        let a = app(r#"{ repo = "x", pass = "tomate1234" }"#);
+        assert_eq!(a.basic_auth(), Some(("admin".into(), "tomate1234".into())));
+    }
+
+    #[test]
+    fn user_overrides_basic_auth_default() {
+        let a = app(r#"{ repo = "x", pass = "s3cr3t", user = "fabio" }"#);
+        assert_eq!(a.basic_auth(), Some(("fabio".into(), "s3cr3t".into())));
+    }
+
+    #[test]
+    fn no_pass_means_no_auth() {
+        assert_eq!(app(r#"{ repo = "x" }"#).basic_auth(), None);
     }
 
     #[test]
     fn commit_and_tag_refs_are_fixed() {
-        assert!(!app("repo: x\nref: a1b2c3d4e5f6").tracks_branch());
-        assert!(!app("repo: x\nref: v1.2.3").tracks_branch());
+        assert!(!app(r#"{ repo = "x", ref = "a1b2c3d4e5f6" }"#).tracks_branch());
+        assert!(!app(r#"{ repo = "x", ref = "v1.2.3" }"#).tracks_branch());
     }
 
     #[test]
     fn explicit_tracking_overrides_inference() {
-        assert!(app("repo: x\nref: v1.2.3\ntracking: branch").tracks_branch());
-        assert!(!app("repo: x\nref: main\ntracking: fixed").tracks_branch());
+        assert!(app(r#"{ repo = "x", ref = "v1.2.3", tracking = "branch" }"#).tracks_branch());
+        assert!(!app(r#"{ repo = "x", ref = "main", tracking = "fixed" }"#).tracks_branch());
     }
 
     #[test]
     fn duplicate_domain_is_rejected() {
-        let cfg: Config = serde_yaml::from_str(
-            "apps:\n  a:\n    repo: x\n    domains: [dup.example.com]\n\
-             \n  b:\n    repo: y\n    domains: [dup.example.com]\n",
-        )
-        .unwrap();
+        let cfg = config(
+            r#"{ apps = {
+                   a = { repo = "x", domains = ["dup.example.com"] },
+                   b = { repo = "y", domains = ["dup.example.com"] },
+                 } }"#,
+        );
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn admin_domain_conflict_is_rejected() {
-        let cfg: Config = serde_yaml::from_str(
-            "proxy:\n  admin_domain: ops.example.com\n\
-             apps:\n  a:\n    repo: x\n    domains: [ops.example.com]\n",
-        )
-        .unwrap();
+        let cfg = config(
+            r#"{ proxy = { admin_domain = "ops.example.com" },
+                 apps = { a = { repo = "x", domains = ["ops.example.com"] } } }"#,
+        );
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn unique_domains_are_accepted() {
-        let cfg: Config = serde_yaml::from_str(
-            "apps:\n  a:\n    repo: x\n    domains: [a.example.com]\n\
-             \n  b:\n    repo: y\n    domains: [b.example.com]\n",
-        )
-        .unwrap();
+        let cfg = config(
+            r#"{ apps = {
+                   a = { repo = "x", domains = ["a.example.com"] },
+                   b = { repo = "y", domains = ["b.example.com"] },
+                 } }"#,
+        );
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn evaluates_full_nickel_config() {
+        // End-to-end through the embedded evaluator, exercising the bits most
+        // likely to break: the `webapp` helper + `| default`, inline `env`, the
+        // internally-tagged `backups.target`, the `ref` field, and an app that
+        // omits the optional healthcheck. No external binary involved.
+        let src = r#"
+            let webapp = fun cfg => { port | default = 3000 } & cfg in
+            {
+              proxy = { admin_domain = "ops.example.com" },
+              backups = { target = { "type" = "local", path = "/var/lib/homeops/backups" }, retention = 7 },
+              apps = {
+                site = webapp {
+                  repo = "git@github.com:you/site.git",
+                  ref = "main",
+                  domains = ["example.com"],
+                  env = { API_KEY = "secret" },
+                  pass = "tomate",
+                  healthcheck = { path = "/", timeout_seconds = 10, interval_seconds = 5, retries = 5 },
+                },
+                api = webapp {
+                  repo = "git@github.com:you/api.git",
+                  domains = ["api.example.com"],
+                },
+              },
+            }
+        "#;
+        let cfg = config(src);
+        cfg.validate().expect("valid config");
+
+        let site = &cfg.apps["site"];
+        assert_eq!(site.port, 3000); // from the `| default`
+        assert_eq!(site.r#ref.as_deref(), Some("main"));
+        assert_eq!(site.env.get("API_KEY").map(String::as_str), Some("secret"));
+        assert_eq!(site.basic_auth(), Some(("admin".into(), "tomate".into())));
+        assert!(site.healthcheck.is_some());
+
+        let api = &cfg.apps["api"];
+        assert!(api.healthcheck.is_none());
+
+        match &cfg.backups.target {
+            BackupTarget::Local { path } => assert_eq!(path, "/var/lib/homeops/backups"),
+            other => panic!("expected local backup target, got {other:?}"),
+        }
     }
 }
