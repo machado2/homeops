@@ -69,7 +69,8 @@ in
       # Persistent host-backed storage: volume name -> mount path. HomeOps backs
       # each with a directory under <workdir>/data/<app>/<name>, re-attached on
       # every restart so data survives rebuilds. Back it up with
-      # `homeops backup volume api` (or `backup all`).
+      # `homeops backup-volume api` (or `backup all`). A value can also be a
+      # record for options: `{ path = "/data", uid = 1000, read_only = true }`.
       volumes = { uploads = "/app/uploads" },
       healthcheck = { path = "/health", timeout_seconds = 10, interval_seconds = 5, retries = 5 },
     },

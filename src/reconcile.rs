@@ -185,28 +185,45 @@ fn start_container(
     })
 }
 
-/// Ensure each declared volume has a host directory, returning the
-/// `(host_path, container_path)` pairs for `docker -v`. Creating the dirs here
-/// (rather than at `ensure_dirs` time) keeps them driven by the live config and
-/// means rollback re-attaches the exact same data. A freshly created dir is made
-/// world-writable so containers running as a non-root UID can write to it; an
-/// existing dir is left untouched so an operator can tighten its permissions.
+/// Ensure each declared volume has a host directory, returning the mounts for
+/// `docker -v`. Creating the dirs here (rather than at `ensure_dirs` time) keeps
+/// them driven by the live config and means rollback re-attaches the exact same
+/// data. Permissions are set only on a *freshly created* dir, so an operator can
+/// tighten them later without HomeOps stomping the change:
+///
+/// * with `uid` set, the dir is chowned to that UID and given `0755`, so a
+///   non-root container can write its own data without world access;
+/// * without `uid`, the dir is made world-writable (`0777`) — the zero-config
+///   default that works for a container running as any UID.
 fn resolve_volumes(
     paths: &Paths,
     app_name: &str,
     app: &AppConfig,
-) -> Result<Vec<(String, String)>> {
+) -> Result<Vec<docker::VolumeMount>> {
     let mut out = Vec::with_capacity(app.volumes.len());
-    for (name, mount) in &app.volumes {
+    for (name, spec) in &app.volumes {
         let host = paths.volume_dir(app_name, name);
         if !host.exists() {
             std::fs::create_dir_all(&host)
                 .with_context(|| format!("creating volume dir {}", host.display()))?;
-            let perms = std::fs::Permissions::from_mode(0o777);
-            std::fs::set_permissions(&host, perms)
-                .with_context(|| format!("setting permissions on {}", host.display()))?;
+            match spec.uid() {
+                Some(uid) => {
+                    std::os::unix::fs::chown(&host, Some(uid), Some(uid))
+                        .with_context(|| format!("chowning {} to uid {uid}", host.display()))?;
+                    std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755))
+                        .with_context(|| format!("setting permissions on {}", host.display()))?;
+                }
+                None => {
+                    std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o777))
+                        .with_context(|| format!("setting permissions on {}", host.display()))?;
+                }
+            }
         }
-        out.push((host.to_string_lossy().into_owned(), mount.clone()));
+        out.push(docker::VolumeMount {
+            host: host.to_string_lossy().into_owned(),
+            container: spec.path().to_string(),
+            read_only: spec.read_only(),
+        });
     }
     Ok(out)
 }

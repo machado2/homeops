@@ -13,6 +13,7 @@ mod proc;
 mod reconcile;
 mod serve;
 mod state;
+mod storage;
 mod systemd;
 
 use anyhow::{Context, Result};
@@ -108,6 +109,14 @@ enum Command {
         name: String,
         #[arg(long)]
         file: PathBuf,
+    },
+    /// Remove an app's orphaned volume dirs (data no longer declared in config).
+    VolumePrune {
+        /// App name.
+        app: String,
+        /// Actually delete (default is a dry run that only lists orphans).
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -304,6 +313,28 @@ async fn run() -> Result<()> {
             println!("restore complete — run `homeops reconcile` (or wait for the timer) to bring `{app}` back up");
             Ok(())
         }
+
+        Command::VolumePrune { app, yes } => {
+            let (_bootstrap, paths) = load_local(&cli.bootstrap)?;
+            let cfg = Config::load(&paths.config_file())?;
+            let app_cfg = cfg
+                .apps
+                .get(&app)
+                .with_context(|| format!("unknown app `{app}`"))?;
+            let orphans = storage::prune(&paths, &app, app_cfg, yes)?;
+            if orphans.is_empty() {
+                println!("no orphaned volume dirs for `{app}`");
+            } else {
+                for dir in &orphans {
+                    let verb = if yes { "removed" } else { "would remove" };
+                    println!("{verb}: {}", dir.display());
+                }
+                if !yes {
+                    println!("\nre-run with --yes to delete these directories");
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -385,7 +416,10 @@ fn print_status(cfg: &Config, paths: &Paths) {
             let vols: Vec<String> = app
                 .volumes
                 .iter()
-                .map(|(n, p)| format!("{n}→{p}"))
+                .map(|(n, s)| {
+                    let ro = if s.read_only() { " (ro)" } else { "" };
+                    format!("{n}→{}{ro}", s.path())
+                })
                 .collect();
             println!("  volumes:   {}", vols.join(", "));
         }

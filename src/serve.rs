@@ -368,6 +368,17 @@ fn status_payload(ctx: &Ctx) -> serde_json::Value {
         .iter()
         .map(|(name, app)| {
             let st = AppState::load(&ctx.paths, name).unwrap_or_default();
+            let volumes: Vec<_> = app
+                .volumes
+                .iter()
+                .map(|(vol, spec)| {
+                    serde_json::json!({
+                        "name": vol,
+                        "path": spec.path(),
+                        "read_only": spec.read_only(),
+                    })
+                })
+                .collect();
             serde_json::json!({
                 "name": name,
                 "domains": app.domains,
@@ -377,6 +388,7 @@ fn status_payload(ctx: &Ctx) -> serde_json::Value {
                 "last_success_at": st.last_success_at,
                 "last_error": st.last_error,
                 "running": docker::is_running(&docker::container_name(name)),
+                "volumes": volumes,
                 "events": state::recent_events(&ctx.paths, name, 5),
             })
         })
@@ -403,9 +415,18 @@ fn dashboard_html(ctx: &Ctx) -> String {
             .map(|c| c.get(..7).unwrap_or(c).to_string())
             .unwrap_or_else(|| "—".into());
         let events = state::recent_events(&ctx.paths, name, 5).join("<br>");
+        let volumes = app
+            .volumes
+            .iter()
+            .map(|(vol, spec)| {
+                let ro = if spec.read_only() { " (ro)" } else { "" };
+                html_escape(&format!("{vol}→{}{ro}", spec.path()))
+            })
+            .collect::<Vec<_>>()
+            .join("<br>");
         rows.push_str(&format!(
             "<tr><td>{name}</td><td>{}</td><td>{}</td><td>{commit}</td><td>{badge}</td>\
-             <td>{}</td><td class=\"ev\">{events}</td></tr>",
+             <td class=\"ev\">{volumes}</td><td>{}</td><td class=\"ev\">{events}</td></tr>",
             html_escape(&app.domains.join(", ")),
             st.current_port.map(|p| p.to_string()).unwrap_or_default(),
             html_escape(st.last_error.as_deref().unwrap_or("")),
@@ -422,7 +443,7 @@ fn dashboard_html(ctx: &Ctx) -> String {
          <p><button onclick=\"act('/api/deploy')\">Deploy now</button>\
          <button onclick=\"act('/api/backup')\">Backup now</button></p>\
          <table><tr><th>App</th><th>Domains</th><th>Port</th><th>Commit</th>\
-         <th>Status</th><th>Last error</th><th>Recent events</th></tr>{rows}</table>\
+         <th>Status</th><th>Volumes</th><th>Last error</th><th>Recent events</th></tr>{rows}</table>\
          <script>async function act(u){{const r=await fetch(u,{{method:'POST'}});\
          alert(JSON.stringify(await r.json(),null,2));location.reload();}}</script>\
          </body></html>",

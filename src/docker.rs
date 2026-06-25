@@ -84,10 +84,16 @@ pub struct RunSpec<'a> {
     pub host_port: u16,
     pub container_port: u16,
     pub env: Vec<(String, String)>,
-    /// Host-backed bind mounts as `(host_path, container_path)` pairs. The host
-    /// paths are absolute and pre-created by HomeOps, so docker treats them as
-    /// bind mounts (never named volumes).
-    pub volumes: Vec<(String, String)>,
+    /// Host-backed bind mounts. The host paths are absolute and pre-created by
+    /// HomeOps, so docker treats them as bind mounts (never named volumes).
+    pub volumes: Vec<VolumeMount>,
+}
+
+/// A single bind mount for an app container.
+pub struct VolumeMount {
+    pub host: String,
+    pub container: String,
+    pub read_only: bool,
 }
 
 /// Start a detached app container bound to localhost only.
@@ -110,9 +116,10 @@ pub fn run_app(spec: &RunSpec) -> Result<()> {
         args.push("-e".into());
         args.push(format!("{k}={v}"));
     }
-    for (host, container) in &spec.volumes {
+    for v in &spec.volumes {
         args.push("-v".into());
-        args.push(format!("{host}:{container}"));
+        let ro = if v.read_only { ":ro" } else { "" };
+        args.push(format!("{}:{}{ro}", v.host, v.container));
     }
     args.push(spec.image.into());
     proc::run("docker", &args)?;

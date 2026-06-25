@@ -114,6 +114,11 @@ impl Paths {
         self.state.join(format!("{app}.json"))
     }
 
+    /// Directory holding all of an app's persistent volumes.
+    pub fn app_data_dir(&self, app: &str) -> PathBuf {
+        self.data.join(app)
+    }
+
     /// Host directory backing a single named volume of an app.
     pub fn volume_dir(&self, app: &str, name: &str) -> PathBuf {
         self.data.join(app).join(name)
@@ -208,7 +213,8 @@ impl Config {
 /// so both need to be well-formed before reconcile ever runs.
 fn validate_volumes(app: &str, cfg: &AppConfig) -> Result<()> {
     let mut mounts: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for (name, path) in &cfg.volumes {
+    for (name, spec) in &cfg.volumes {
+        let path = spec.path();
         // The name is used as a directory component under `<workdir>/data/<app>/`.
         let valid_name = !name.is_empty()
             && !name.starts_with('.')
@@ -451,12 +457,12 @@ pub struct AppConfig {
     /// Managed databases used by this app.
     #[serde(default)]
     pub databases: AppDatabases,
-    /// Persistent host-backed storage: volume name → mount path inside the
-    /// container. The name is stable identity; HomeOps backs each volume with a
-    /// host directory under `<workdir>/data/<app>/<name>` and re-attaches it on
-    /// every (re)start, so data survives rebuilds, restarts and rollbacks.
+    /// Persistent host-backed storage: volume name → mount spec. The name is
+    /// stable identity; HomeOps backs each volume with a host directory under
+    /// `<workdir>/data/<app>/<name>` and re-attaches it on every (re)start, so
+    /// data survives rebuilds, restarts and rollbacks.
     #[serde(default)]
-    pub volumes: BTreeMap<String, String>,
+    pub volumes: BTreeMap<String, VolumeSpec>,
     /// Optional HTTP healthcheck.
     #[serde(default)]
     pub healthcheck: Option<Healthcheck>,
@@ -494,6 +500,93 @@ impl AppConfig {
         let pass = self.pass.as_ref()?;
         let user = self.user.as_deref().unwrap_or("admin");
         Some((user.to_string(), pass.clone()))
+    }
+}
+
+/// How a single volume mounts. Accepts either a bare mount path
+/// (`data = "/data"`) or a record with options
+/// (`data = { path = "/data", read_only = true, uid = 1000 }`). The bare-string
+/// form is the common case and stays valid forever.
+///
+/// Deserialization is hand-written rather than `#[serde(untagged)]` because the
+/// embedded Nickel deserializer does not support the buffering untagged enums
+/// rely on; a `deserialize_any` visitor that accepts a string *or* a map works.
+#[derive(Debug, Clone, Serialize)]
+pub struct VolumeSpec {
+    /// Container mount path.
+    pub path: String,
+    /// Mount the volume read-only (`:ro`).
+    pub read_only: bool,
+    /// Own a *newly created* host directory by this UID so a non-root container
+    /// can write to it without the world-writable default.
+    pub uid: Option<u32>,
+}
+
+impl VolumeSpec {
+    /// The container mount path.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Whether the mount is read-only.
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// The UID that should own a freshly created host directory, if set.
+    pub fn uid(&self) -> Option<u32> {
+        self.uid
+    }
+}
+
+impl<'de> Deserialize<'de> for VolumeSpec {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct SpecVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for SpecVisitor {
+            type Value = VolumeSpec;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a mount path string or a { path, read_only, uid } record")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<VolumeSpec, E> {
+                Ok(VolumeSpec {
+                    path: v.to_string(),
+                    read_only: false,
+                    uid: None,
+                })
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<VolumeSpec, A::Error> {
+                let mut path: Option<String> = None;
+                let mut read_only: Option<bool> = None;
+                let mut uid: Option<u32> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "path" => path = Some(map.next_value()?),
+                        "read_only" => read_only = Some(map.next_value()?),
+                        "uid" => uid = map.next_value()?,
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(VolumeSpec {
+                    path: path.ok_or_else(|| serde::de::Error::missing_field("path"))?,
+                    read_only: read_only.unwrap_or(false),
+                    uid,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(SpecVisitor)
     }
 }
 
@@ -646,6 +739,33 @@ mod tests {
     }
 
     #[test]
+    fn bare_string_volume_is_writable_root() {
+        let a = app(r#"{ repo = "x", volumes = { data = "/data" } }"#);
+        let v = &a.volumes["data"];
+        assert_eq!(v.path(), "/data");
+        assert!(!v.read_only());
+        assert_eq!(v.uid(), None);
+    }
+
+    #[test]
+    fn record_volume_parses_options() {
+        let a = app(
+            r#"{ repo = "x", volumes = { data = { path = "/data", read_only = true, uid = 1000 } } }"#,
+        );
+        let v = &a.volumes["data"];
+        assert_eq!(v.path(), "/data");
+        assert!(v.read_only());
+        assert_eq!(v.uid(), Some(1000));
+    }
+
+    #[test]
+    fn record_volume_is_validated_too() {
+        let cfg =
+            config(r#"{ apps = { a = { repo = "x", volumes = { data = { path = "rel" } } } } }"#);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
     fn unique_domains_are_accepted() {
         let cfg = config(
             r#"{ apps = {
@@ -692,9 +812,9 @@ mod tests {
         assert_eq!(site.r#ref.as_deref(), Some("main"));
         assert_eq!(site.env.get("API_KEY").map(String::as_str), Some("secret"));
         assert_eq!(site.basic_auth(), Some(("admin".into(), "tomate".into())));
-        assert_eq!(site.volumes.get("data").map(String::as_str), Some("/data"));
+        assert_eq!(site.volumes.get("data").map(|v| v.path()), Some("/data"));
         assert_eq!(
-            site.volumes.get("uploads").map(String::as_str),
+            site.volumes.get("uploads").map(|v| v.path()),
             Some("/app/uploads")
         );
         assert!(site.healthcheck.is_some());

@@ -96,6 +96,7 @@ and prints final status.
 | `homeops restore <postgres\|mysql> <db> --file <dump>` / `restore latest` | Restore a backup (always takes a safety backup first). |
 | `homeops backup-volume <app> [name]` | Archive an app's volume(s) to the backup target. |
 | `homeops restore-volume <app> <name> --file <tar>` | Restore an app volume (safety backup first; stops the app). |
+| `homeops volume-prune <app> [--yes]` | List (or with `--yes`, delete) an app's orphaned volume dirs. |
 
 ## Configuration
 
@@ -192,6 +193,26 @@ api = webapp {
   backup target, with retention. Restore with
   `homeops restore-volume <app> <name> --file <tar>` — it takes a safety backup
   and stops the app first, then the next reconcile brings it back up.
+- **Prune.** Renaming or removing a volume leaves its old directory in place
+  (never auto-deleted); `homeops doctor` flags it as an orphan. Delete orphans
+  with `homeops volume-prune <app>` (a dry run by default; add `--yes` to
+  actually remove).
+
+For finer control, a volume value can be a record instead of a bare path:
+
+```nickel
+volumes = {
+  cache  = "/cache",                                  # writable, world-writable dir
+  data   = { path = "/data", uid = 1000 },            # owned by uid 1000, mode 0755
+  assets = { path = "/assets", read_only = true },    # mounted read-only (:ro)
+}
+```
+
+- `uid` chowns a *newly created* directory to that user (mode `0755`) instead of
+  the world-writable default — use it when the container runs as a fixed non-root
+  UID and you'd rather not have a `0777` directory.
+- `read_only` mounts the volume `:ro` (handy for assets the app should not
+  modify).
 
 > The disposable-server promise still holds, but it shifts: with volumes, *all
 > state is either in Git or in a backup target*. Set up a remote backup target if
@@ -238,7 +259,8 @@ CI builds and checks the project on Linux on every push (see
 - **v0.3 / v0.4** managed Postgres / MySQL with per-app databases and backup/restore.
 - **v0.5** remote backup targets (SSH, S3-compatible), `restore latest`, retention.
 - **v0.6** optional Caddy management with an ownership marker and reload.
-- **v0.7** managed per-app volumes (host-backed) with tar backup/restore.
+- **v0.7** managed per-app volumes (host-backed) with `read_only`/`uid` options,
+  tar backup/restore, orphan detection (`doctor`) and `volume-prune`.
 - **Later** workers, cron, Compose, Podman, webhooks, config editing via PR,
   multi-server.
 

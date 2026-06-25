@@ -95,6 +95,28 @@ pub fn run(bootstrap: Option<&Bootstrap>, cfg: Option<&Config>, paths: &Paths) -
                 )),
                 Err(e) => checks.push(Check::fail(&format!("app:{name}"), e.to_string())),
             }
+
+            // Declared volumes: report each host dir's state (never a failure —
+            // a not-yet-created dir is normal before the first deploy).
+            for vol in app.volumes.keys() {
+                let dir = paths.volume_dir(name, vol);
+                let detail = if dir.is_dir() {
+                    dir.display().to_string()
+                } else {
+                    format!("{} (created on first deploy)", dir.display())
+                };
+                checks.push(Check::ok(&format!("vol:{name}/{vol}"), detail));
+            }
+            // Orphaned dirs: data from a renamed/removed volume, left in place.
+            for orphan in crate::storage::orphan_dirs(paths, name, app) {
+                checks.push(Check::ok(
+                    &format!("vol:{name}"),
+                    format!(
+                        "orphan {} — not in config (`homeops volume-prune {name}` to remove)",
+                        orphan.display()
+                    ),
+                ));
+            }
         }
 
         // Databases.
