@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 /// What reconcile would (or did) do for a single app.
@@ -124,7 +125,7 @@ fn reconcile_app(cfg: &Config, paths: &Paths, name: &str, app: &AppConfig) -> Re
     let taken = taken_ports(paths, cfg, name);
     let port = state::allocate_port(&mut st, &taken)?;
 
-    start_container(&container, &image, port, app, &env)?;
+    start_container(paths, name, &container, &image, port, app, &env)?;
 
     // 6. Healthcheck (or grace period) → rollback on failure.
     match check_health(port, app) {
@@ -145,7 +146,15 @@ fn reconcile_app(cfg: &Config, paths: &Paths, name: &str, app: &AppConfig) -> Re
         }
         Err(e) => {
             state::record_event(paths, name, &format!("healthcheck failed: {e}"))?;
-            rollback(&container, previous_image.as_deref(), port, app, &env)?;
+            rollback(
+                paths,
+                name,
+                &container,
+                previous_image.as_deref(),
+                port,
+                app,
+                &env,
+            )?;
             state::record_event(paths, name, "rollback done")?;
             st.last_error = Some(format!("healthcheck failed: {e}"));
             st.save(paths)?;
@@ -155,6 +164,8 @@ fn reconcile_app(cfg: &Config, paths: &Paths, name: &str, app: &AppConfig) -> Re
 }
 
 fn start_container(
+    paths: &Paths,
+    app_name: &str,
     container: &str,
     image: &str,
     port: u16,
@@ -162,6 +173,7 @@ fn start_container(
     env: &[(String, String)],
 ) -> Result<()> {
     docker::remove(container)?;
+    let volumes = resolve_volumes(paths, app_name, app)?;
     docker::run_app(&docker::RunSpec {
         name: container,
         image,
@@ -169,11 +181,40 @@ fn start_container(
         host_port: port,
         container_port: app.port,
         env: env.to_vec(),
+        volumes,
     })
+}
+
+/// Ensure each declared volume has a host directory, returning the
+/// `(host_path, container_path)` pairs for `docker -v`. Creating the dirs here
+/// (rather than at `ensure_dirs` time) keeps them driven by the live config and
+/// means rollback re-attaches the exact same data. A freshly created dir is made
+/// world-writable so containers running as a non-root UID can write to it; an
+/// existing dir is left untouched so an operator can tighten its permissions.
+fn resolve_volumes(
+    paths: &Paths,
+    app_name: &str,
+    app: &AppConfig,
+) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::with_capacity(app.volumes.len());
+    for (name, mount) in &app.volumes {
+        let host = paths.volume_dir(app_name, name);
+        if !host.exists() {
+            std::fs::create_dir_all(&host)
+                .with_context(|| format!("creating volume dir {}", host.display()))?;
+            let perms = std::fs::Permissions::from_mode(0o777);
+            std::fs::set_permissions(&host, perms)
+                .with_context(|| format!("setting permissions on {}", host.display()))?;
+        }
+        out.push((host.to_string_lossy().into_owned(), mount.clone()));
+    }
+    Ok(out)
 }
 
 /// Restore the previous image, or just stop the broken container if there is none.
 fn rollback(
+    paths: &Paths,
+    app_name: &str,
     container: &str,
     previous_image: Option<&str>,
     port: u16,
@@ -181,7 +222,7 @@ fn rollback(
     env: &[(String, String)],
 ) -> Result<()> {
     match previous_image {
-        Some(image) => start_container(container, image, port, app, env),
+        Some(image) => start_container(paths, app_name, container, image, port, app, env),
         None => docker::remove(container),
     }
 }

@@ -81,6 +81,7 @@ pub struct Paths {
     pub checkouts: PathBuf,
     pub state: PathBuf,
     pub backups: PathBuf,
+    pub data: PathBuf,
     pub run: PathBuf,
     pub install_manifest: PathBuf,
 }
@@ -93,6 +94,7 @@ impl Paths {
             checkouts: workdir.join("checkouts"),
             state: workdir.join("state"),
             backups: workdir.join("backups"),
+            data: workdir.join("data"),
             run: PathBuf::from("/run/homeops"),
             install_manifest: workdir.join("install-manifest.json"),
             workdir,
@@ -110,6 +112,11 @@ impl Paths {
 
     pub fn state_file(&self, app: &str) -> PathBuf {
         self.state.join(format!("{app}.json"))
+    }
+
+    /// Host directory backing a single named volume of an app.
+    pub fn volume_dir(&self, app: &str, name: &str) -> PathBuf {
+        self.data.join(app).join(name)
     }
 
     pub fn events_file(&self, app: &str) -> PathBuf {
@@ -130,6 +137,7 @@ impl Paths {
             &self.backups,
             &self.backups.join("postgres"),
             &self.backups.join("mysql"),
+            &self.data,
             &self.run,
         ] {
             std::fs::create_dir_all(dir)
@@ -189,9 +197,50 @@ impl Config {
                 }
                 seen.insert(key, name.clone());
             }
+            validate_volumes(name, app)?;
         }
         Ok(())
     }
+}
+
+/// Reject volume declarations that would be ambiguous or unsafe. Volume names
+/// become host path components, and the mount paths are passed to `docker -v`,
+/// so both need to be well-formed before reconcile ever runs.
+fn validate_volumes(app: &str, cfg: &AppConfig) -> Result<()> {
+    let mut mounts: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (name, path) in &cfg.volumes {
+        // The name is used as a directory component under `<workdir>/data/<app>/`.
+        let valid_name = !name.is_empty()
+            && !name.starts_with('.')
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if !valid_name {
+            anyhow::bail!(
+                "app `{app}`: invalid volume name `{name}` (use letters, digits, `-`, `_`)"
+            );
+        }
+        // A relative path makes docker treat it as a *named* volume, silently
+        // diverging from the host-backed model.
+        if !Path::new(path).is_absolute() {
+            anyhow::bail!("app `{app}`: volume `{name}` mount path `{path}` must be absolute");
+        }
+        let normalized = path.trim_end_matches('/');
+        if normalized.is_empty() {
+            anyhow::bail!("app `{app}`: volume `{name}` cannot mount at `/`");
+        }
+        for danger in [
+            "/etc", "/usr", "/bin", "/sbin", "/lib", "/boot", "/dev", "/proc", "/sys",
+        ] {
+            if normalized == danger {
+                anyhow::bail!("app `{app}`: volume `{name}` refuses to mount over `{danger}`");
+            }
+        }
+        if !mounts.insert(normalized.to_string()) {
+            anyhow::bail!("app `{app}`: two volumes mount at the same path `{normalized}`");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -402,6 +451,12 @@ pub struct AppConfig {
     /// Managed databases used by this app.
     #[serde(default)]
     pub databases: AppDatabases,
+    /// Persistent host-backed storage: volume name → mount path inside the
+    /// container. The name is stable identity; HomeOps backs each volume with a
+    /// host directory under `<workdir>/data/<app>/<name>` and re-attaches it on
+    /// every (re)start, so data survives rebuilds, restarts and rollbacks.
+    #[serde(default)]
+    pub volumes: BTreeMap<String, String>,
     /// Optional HTTP healthcheck.
     #[serde(default)]
     pub healthcheck: Option<Healthcheck>,
@@ -556,6 +611,41 @@ mod tests {
     }
 
     #[test]
+    fn relative_volume_path_is_rejected() {
+        let cfg = config(r#"{ apps = { a = { repo = "x", volumes = { data = "data" } } } }"#);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn duplicate_mount_path_is_rejected() {
+        let cfg = config(
+            r#"{ apps = { a = { repo = "x", volumes = { one = "/data", two = "/data/" } } } }"#,
+        );
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn invalid_volume_name_is_rejected() {
+        let cfg =
+            config(r#"{ apps = { a = { repo = "x", volumes = { "../escape" = "/data" } } } }"#);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn mounting_over_system_path_is_rejected() {
+        let cfg = config(r#"{ apps = { a = { repo = "x", volumes = { etc = "/etc" } } } }"#);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn valid_volumes_are_accepted() {
+        let cfg = config(
+            r#"{ apps = { a = { repo = "x", volumes = { data = "/data", uploads = "/app/uploads" } } } }"#,
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
     fn unique_domains_are_accepted() {
         let cfg = config(
             r#"{ apps = {
@@ -584,6 +674,7 @@ mod tests {
                   domains = ["example.com"],
                   env = { API_KEY = "secret" },
                   pass = "tomate",
+                  volumes = { data = "/data", uploads = "/app/uploads" },
                   healthcheck = { path = "/", timeout_seconds = 10, interval_seconds = 5, retries = 5 },
                 },
                 api = webapp {
@@ -601,6 +692,11 @@ mod tests {
         assert_eq!(site.r#ref.as_deref(), Some("main"));
         assert_eq!(site.env.get("API_KEY").map(String::as_str), Some("secret"));
         assert_eq!(site.basic_auth(), Some(("admin".into(), "tomate".into())));
+        assert_eq!(site.volumes.get("data").map(String::as_str), Some("/data"));
+        assert_eq!(
+            site.volumes.get("uploads").map(String::as_str),
+            Some("/app/uploads")
+        );
         assert!(site.healthcheck.is_some());
 
         let api = &cfg.apps["api"];

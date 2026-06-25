@@ -36,8 +36,9 @@ Git. The UI can operate, but it does not configure.
 ## What it is *not* (in v1)
 
 No `docker-compose`, Kubernetes, Helm, sidecars, workers, per-app cron, managed
-Redis/Elasticsearch/MinIO, arbitrary volumes, app-defined databases, a visual
-config editor, a marketplace, a plugin system, multi-server, clustering, or HA.
+Redis/Elasticsearch/MinIO, app-defined infrastructure (volumes and databases are
+declared in the infra repo, never by the app), a visual config editor, a
+marketplace, a plugin system, multi-server, clustering, or HA.
 
 If you need those, Coolify, Dokku, Kamal, CapRover, Kubernetes or Nomad probably
 fits better.
@@ -60,9 +61,11 @@ To be compatible with HomeOps v1, an app must:
 2. Run as a single web process/container, listening on `0.0.0.0:$PORT`.
 3. Take configuration from environment variables.
 4. Log to `stdout`/`stderr`.
-5. Not depend on persistent state inside the container.
+5. Not depend on persistent state inside the container, *unless* it is declared
+   as a `volumes` mount (see [Persistent storage](#persistent-storage)).
 6. Use `DATABASE_URL` for Postgres / `MYSQL_URL` for MySQL when needed.
-7. Keep uploads and persistent files outside the container (S3/R2/etc.).
+7. Keep uploads and persistent files in a declared `volume` or outside the
+   container (S3/R2/etc.).
 
 ## Install
 
@@ -91,6 +94,8 @@ and prints final status.
 | `homeops doctor` | Diagnose the environment (Docker, systemd, repos, DBs…). |
 | `homeops backup <postgres\|mysql\|all> [db]` | Create a logical database backup. |
 | `homeops restore <postgres\|mysql> <db> --file <dump>` / `restore latest` | Restore a backup (always takes a safety backup first). |
+| `homeops backup-volume <app> [name]` | Archive an app's volume(s) to the backup target. |
+| `homeops restore-volume <app> <name> --file <tar>` | Restore an app volume (safety backup first; stops the app). |
 
 ## Configuration
 
@@ -158,6 +163,40 @@ behind HTTP basic auth at the proxy. The username defaults to `admin`; override
 it with `user:`. No-frills and plaintext, like the rest of the config — the
 infra repo is private.
 
+### Persistent storage
+
+Apps are stateless by default, but some need to keep files on disk (uploads, a
+SQLite file, a search index). Declare them per app with a `volumes` map of
+`name → mount path`:
+
+```nickel
+api = webapp {
+  repo = "git@github.com:you/api.git",
+  domains = ["api.example.com"],
+  volumes = { uploads = "/app/uploads", data = "/data" },
+}
+```
+
+- **Host-backed.** Each volume is a plain directory under
+  `<workdir>/data/<app>/<name>` (e.g. `/var/lib/homeops/data/api/uploads`),
+  bind-mounted into the container. It is visible on the host, survives container
+  rebuilds, restarts and rollbacks, and is removed by `uninstall --purge`.
+- **The name is the identity.** Changing a volume's *mount path* keeps the data
+  (same host directory). *Renaming* the volume points the app at a fresh, empty
+  directory; the old one is left in place, never auto-deleted.
+- **Permissions.** A freshly created volume directory is made world-writable so
+  containers running as a non-root user can write to it. Tighten it yourself
+  afterwards if you need to — HomeOps won't re-loosen an existing directory.
+- **Back it up.** `homeops backup-volume <app>` (or `homeops backup all`, and
+  the dashboard "Backup now" button) archives volumes as gzip tarballs into the
+  backup target, with retention. Restore with
+  `homeops restore-volume <app> <name> --file <tar>` — it takes a safety backup
+  and stops the app first, then the next reconcile brings it back up.
+
+> The disposable-server promise still holds, but it shifts: with volumes, *all
+> state is either in Git or in a backup target*. Set up a remote backup target if
+> the data matters.
+
 ## How it works
 
 - **State.** Observed state lives outside Git in `/var/lib/homeops/state/<app>.json`
@@ -199,8 +238,9 @@ CI builds and checks the project on Linux on every push (see
 - **v0.3 / v0.4** managed Postgres / MySQL with per-app databases and backup/restore.
 - **v0.5** remote backup targets (SSH, S3-compatible), `restore latest`, retention.
 - **v0.6** optional Caddy management with an ownership marker and reload.
-- **Later** managed volumes, workers, cron, Compose, Podman, webhooks, config
-  editing via PR, multi-server.
+- **v0.7** managed per-app volumes (host-backed) with tar backup/restore.
+- **Later** workers, cron, Compose, Podman, webhooks, config editing via PR,
+  multi-server.
 
 ## License
 

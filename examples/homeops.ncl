@@ -66,6 +66,11 @@ in
       domains = ["api.example.com"],
       env = { LOG_LEVEL = "info" },
       databases = { postgres = { database = "api", env_var = "DATABASE_URL" } },
+      # Persistent host-backed storage: volume name -> mount path. HomeOps backs
+      # each with a directory under <workdir>/data/<app>/<name>, re-attached on
+      # every restart so data survives rebuilds. Back it up with
+      # `homeops backup volume api` (or `backup all`).
+      volumes = { uploads = "/app/uploads" },
       healthcheck = { path = "/health", timeout_seconds = 10, interval_seconds = 5, retries = 5 },
     },
   },

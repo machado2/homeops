@@ -93,6 +93,22 @@ enum Command {
         #[arg(long)]
         file: Option<PathBuf>,
     },
+    /// Back up an app's persistent volume(s) into the backup target.
+    BackupVolume {
+        /// App name.
+        app: String,
+        /// Volume name (omit to back up all of the app's volumes).
+        name: Option<String>,
+    },
+    /// Restore an app's persistent volume from a tarball.
+    RestoreVolume {
+        /// App name.
+        app: String,
+        /// Volume name.
+        name: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -264,6 +280,30 @@ async fn run() -> Result<()> {
             println!("restore complete");
             Ok(())
         }
+
+        Command::BackupVolume { app, name } => {
+            let (_bootstrap, paths) = load_local(&cli.bootstrap)?;
+            let cfg = Config::load(&paths.config_file())?;
+            let files = match name {
+                Some(name) => vec![backup::backup_volume(&cfg, &paths, &app, &name)?],
+                None => backup::backup_app_volumes(&cfg, &paths, &app)?,
+            };
+            for f in files {
+                println!("backed up: {}", f.display());
+            }
+            Ok(())
+        }
+
+        Command::RestoreVolume { app, name, file } => {
+            let (_bootstrap, paths) = load_local(&cli.bootstrap)?;
+            let cfg = Config::load(&paths.config_file())?;
+            // Hold the reconcile lock so the timer can't bring the app back up
+            // mid-restore.
+            let _lock = state::ReconcileLock::acquire(&paths)?;
+            backup::restore_volume(&cfg, &paths, &app, &name, &file)?;
+            println!("restore complete — run `homeops reconcile` (or wait for the timer) to bring `{app}` back up");
+            Ok(())
+        }
     }
 }
 
@@ -341,6 +381,14 @@ fn print_status(cfg: &Config, paths: &Paths) {
         let running = docker::is_running(&docker::container_name(name));
         println!("\n{name}");
         println!("  domains:   {}", app.domains.join(", "));
+        if !app.volumes.is_empty() {
+            let vols: Vec<String> = app
+                .volumes
+                .iter()
+                .map(|(n, p)| format!("{n}→{p}"))
+                .collect();
+            println!("  volumes:   {}", vols.join(", "));
+        }
         println!(
             "  port:      {}",
             st.current_port
