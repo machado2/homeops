@@ -14,25 +14,21 @@ use std::path::{Path, PathBuf};
 /// Apply the permissions a freshly provisioned volume directory should have.
 /// This is the single source of truth shared by reconcile (on first create) and
 /// restore (after clearing+extracting), so a restored volume ends up exactly as
-/// writable as a reconciled one:
+/// writable as a reconciled one. The directory is kept private (`0700`) either
+/// way — app data is never world-accessible:
 ///
-/// * with `uid` set, the dir is chowned to that UID and given `0755`, so a
-///   non-root container can write its own data without world access;
-/// * without `uid`, the dir is made world-writable (`0777`) — the zero-config
-///   default that works for a container running as any UID.
+/// * with `uid` set, the dir is chowned to that UID, so a container running as
+///   that non-root user can write its own data;
+/// * without `uid`, the dir stays root-owned — which is writable by a container
+///   running as root (the default for most images). A container that drops to a
+///   non-root user must declare `uid`, or it will not be able to write.
 pub fn apply_dir_perms(dir: &Path, spec: Option<&VolumeSpec>) -> Result<()> {
-    match spec.and_then(|s| s.uid()) {
-        Some(uid) => {
-            std::os::unix::fs::chown(dir, Some(uid), Some(uid))
-                .with_context(|| format!("chowning {} to uid {uid}", dir.display()))?;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
-                .with_context(|| format!("setting permissions on {}", dir.display()))?;
-        }
-        None => {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777))
-                .with_context(|| format!("setting permissions on {}", dir.display()))?;
-        }
+    if let Some(uid) = spec.and_then(|s| s.uid()) {
+        std::os::unix::fs::chown(dir, Some(uid), Some(uid))
+            .with_context(|| format!("chowning {} to uid {uid}", dir.display()))?;
     }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("setting permissions on {}", dir.display()))?;
     Ok(())
 }
 

@@ -187,13 +187,9 @@ fn start_container(
 /// Ensure each declared volume has a host directory, returning the mounts for
 /// `docker -v`. Creating the dirs here (rather than at `ensure_dirs` time) keeps
 /// them driven by the live config and means rollback re-attaches the exact same
-/// data. Permissions are set only on a *freshly created* dir, so an operator can
-/// tighten them later without HomeOps stomping the change:
-///
-/// * with `uid` set, the dir is chowned to that UID and given `0755`, so a
-///   non-root container can write its own data without world access;
-/// * without `uid`, the dir is made world-writable (`0777`) — the zero-config
-///   default that works for a container running as any UID.
+/// data. Permissions are set only on a *freshly created* dir (see
+/// [`crate::storage::apply_dir_perms`]), so an operator can tighten them later
+/// without HomeOps stomping the change.
 fn resolve_volumes(
     paths: &Paths,
     app_name: &str,

@@ -237,7 +237,7 @@ pub fn restore_volume(
     untar_into(file, &src).with_context(|| format!("restoring volume {app}/{name}"))?;
 
     // Re-apply the volume's permissions: the freshly cleared dir must end up as
-    // writable as a reconciled one (uid-owned or world-writable), or a non-root
+    // writable as a reconciled one (uid-owned when `uid` is set), or the
     // container would fail to write to its restored data.
     let spec = cfg.apps.get(app).and_then(|a| a.volumes.get(name));
     crate::storage::apply_dir_perms(&src, spec)?;

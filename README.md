@@ -185,9 +185,12 @@ api = webapp {
 - **The name is the identity.** Changing a volume's *mount path* keeps the data
   (same host directory). *Renaming* the volume points the app at a fresh, empty
   directory; the old one is left in place, never auto-deleted.
-- **Permissions.** A freshly created volume directory is made world-writable so
-  containers running as a non-root user can write to it. Tighten it yourself
-  afterwards if you need to — HomeOps won't re-loosen an existing directory.
+- **Permissions.** A freshly created volume directory is private (`0700`) and
+  root-owned, so a container running as **root** (the default for most images)
+  can write to it and nothing else on the host can. A container that runs as a
+  **non-root** user must declare `uid` (see below) so HomeOps chowns the
+  directory to it. HomeOps only sets permissions on first creation — tighten or
+  adjust an existing directory yourself and it won't be re-stomped.
 - **Back it up.** `homeops backup-volume <app>` (or `homeops backup all`, and
   the dashboard "Backup now" button) archives volumes as gzip tarballs into the
   backup target, with retention. Restore with
@@ -203,15 +206,15 @@ For finer control, a volume value can be a record instead of a bare path:
 
 ```nickel
 volumes = {
-  cache  = "/cache",                                  # writable, world-writable dir
-  data   = { path = "/data", uid = 1000 },            # owned by uid 1000, mode 0755
+  cache  = "/cache",                                  # private 0700 dir, root-owned
+  data   = { path = "/data", uid = 1000 },            # owned by uid 1000 (private 0700)
   assets = { path = "/assets", read_only = true },    # mounted read-only (:ro)
 }
 ```
 
-- `uid` chowns a *newly created* directory to that user (mode `0755`) instead of
-  the world-writable default — use it when the container runs as a fixed non-root
-  UID and you'd rather not have a `0777` directory.
+- `uid` chowns a *newly created* directory to that user — set it when the
+  container runs as a fixed non-root UID, otherwise it cannot write to the
+  root-owned `0700` directory.
 - `read_only` mounts the volume `:ro` (handy for assets the app should not
   modify).
 

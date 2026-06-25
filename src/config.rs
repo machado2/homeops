@@ -540,7 +540,7 @@ pub struct VolumeSpec {
     /// Mount the volume read-only (`:ro`).
     pub read_only: bool,
     /// Own a *newly created* host directory by this UID so a non-root container
-    /// can write to it without the world-writable default.
+    /// can write to its otherwise root-owned `0700` data directory.
     pub uid: Option<u32>,
 }
 
