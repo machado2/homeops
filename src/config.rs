@@ -195,6 +195,7 @@ impl Config {
             seen.insert(d.clone(), "<admin>".to_string());
         }
         for (name, app) in &self.apps {
+            validate_app_name(name)?;
             for domain in &app.domains {
                 let key = domain.to_lowercase();
                 if let Some(prev) = seen.get(&key) {
@@ -206,6 +207,22 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// An app name is used verbatim as a host path component (checkouts, state,
+/// `<workdir>/data/<app>/…`) and as a Docker container name, and it is the
+/// target of destructive operations like `volume-prune`. Reject anything that
+/// could escape those paths or confuse Docker.
+fn validate_app_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !ok {
+        anyhow::bail!("invalid app name `{name}` (use letters, digits, `-`, `_`)");
+    }
+    Ok(())
 }
 
 /// Reject volume declarations that would be ambiguous or unsafe. Volume names
@@ -230,6 +247,11 @@ fn validate_volumes(app: &str, cfg: &AppConfig) -> Result<()> {
         // diverging from the host-backed model.
         if !Path::new(path).is_absolute() {
             anyhow::bail!("app `{app}`: volume `{name}` mount path `{path}` must be absolute");
+        }
+        // `:` is docker's `-v host:container[:mode]` separator; a colon in the
+        // container path would be misread as a mount option.
+        if path.contains(':') {
+            anyhow::bail!("app `{app}`: volume `{name}` mount path `{path}` must not contain `:`");
         }
         let normalized = path.trim_end_matches('/');
         if normalized.is_empty() {
@@ -763,6 +785,25 @@ mod tests {
         let cfg =
             config(r#"{ apps = { a = { repo = "x", volumes = { data = { path = "rel" } } } } }"#);
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn colon_in_mount_path_is_rejected() {
+        let cfg =
+            config(r#"{ apps = { a = { repo = "x", volumes = { data = "/data:cached" } } } }"#);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn traversal_app_name_is_rejected() {
+        let cfg = config(r#"{ apps = { "../escape" = { repo = "x" } } }"#);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn normal_app_name_is_accepted() {
+        let cfg = config(r#"{ apps = { "my-api_2" = { repo = "x" } } }"#);
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
