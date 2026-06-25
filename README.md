@@ -93,7 +93,7 @@ and prints final status.
 | `homeops status` | Show current state of all apps. |
 | `homeops doctor` | Diagnose the environment (Docker, systemd, repos, DBs…). |
 | `homeops backup <postgres\|mysql\|all> [db]` | Create a logical database backup. |
-| `homeops restore <postgres\|mysql> <db> --file <dump>` / `restore latest` | Restore a backup (always takes a safety backup first). |
+| `homeops restore <postgres\|mysql> <db> --file <dump>` / `restore latest` | Restore a database backup (`latest` is databases-only; always takes a safety backup first). |
 | `homeops backup-volume <app> [name]` | Archive an app's volume(s) to the backup target. |
 | `homeops restore-volume <app> <name> --file <tar>` | Restore an app volume (safety backup first; stops the app). |
 | `homeops volume-prune <app> [--yes]` | List (or with `--yes`, delete) an app's orphaned volume dirs. |
@@ -192,7 +192,8 @@ api = webapp {
   the dashboard "Backup now" button) archives volumes as gzip tarballs into the
   backup target, with retention. Restore with
   `homeops restore-volume <app> <name> --file <tar>` — it takes a safety backup
-  and stops the app first, then the next reconcile brings it back up.
+  and stops the app first, then the next reconcile brings it back up. (Volume
+  restore is always explicit; `restore latest` covers databases only.)
 - **Prune.** Renaming or removing a volume leaves its old directory in place
   (never auto-deleted); `homeops doctor` flags it as an orphan. Delete orphans
   with `homeops volume-prune <app>` (a dry run by default; add `--yes` to
