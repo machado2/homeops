@@ -7,6 +7,7 @@ use crate::config::{Config, Paths};
 use crate::databases::{MYSQL_CONTAINER, PG_CONTAINER};
 use crate::{docker, proc, state};
 use anyhow::{Context, Result};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,8 +75,22 @@ pub fn backup_all(cfg: &Config, paths: &Paths) -> Result<Vec<PathBuf>> {
         }
         for vol_name in app.volumes.keys() {
             // Skip volumes whose data dir does not exist yet (app never started).
-            if paths.volume_dir(app_name, vol_name).is_dir() {
-                out.push(backup_volume(cfg, paths, app_name, vol_name)?);
+            if !paths.volume_dir(app_name, vol_name).is_dir() {
+                continue;
+            }
+            // One failing volume must not abort the whole run — the point of
+            // `backup all` is to get *everything* it can to the backup target.
+            match backup_volume(cfg, paths, app_name, vol_name) {
+                Ok(file) => out.push(file),
+                Err(e) => {
+                    eprintln!("warning: backing up volume {app_name}/{vol_name} failed: {e:#}");
+                    state::record_event(
+                        paths,
+                        app_name,
+                        &format!("volume `{vol_name}` backup FAILED: {e}"),
+                    )
+                    .ok();
+                }
             }
         }
     }
@@ -88,6 +103,73 @@ fn volume_backup_dir(paths: &Paths, app: &str, name: &str) -> PathBuf {
     paths.backups.join("volumes").join(app).join(name)
 }
 
+/// gzip-tar the *contents* of `src` (so it restores into any target dir) into
+/// `dest`. Uses an argument vector rather than a shell string, so paths with
+/// quotes or other shell metacharacters can never break out of the command.
+fn tar_dir(src: &Path, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    proc::run(
+        "tar",
+        &[
+            OsStr::new("-C"),
+            src.as_os_str(),
+            OsStr::new("-czf"),
+            dest.as_os_str(),
+            OsStr::new("."),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Extract a gzip tarball into an existing directory (argv, not a shell string).
+fn untar_into(archive: &Path, dest: &Path) -> Result<()> {
+    proc::run(
+        "tar",
+        &[
+            OsStr::new("-C"),
+            dest.as_os_str(),
+            OsStr::new("-xzf"),
+            archive.as_os_str(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Remove every entry inside `dir` without removing `dir` itself (so a live bind
+/// mount keeps its inode). Symlinks are unlinked, never followed.
+fn clear_dir(dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let meta = std::fs::symlink_metadata(&path)?;
+        if meta.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Archive a directory into the un-pruned `safety/` tree. Unlike a normal
+/// volume backup this is never subject to retention, so it can never evict the
+/// archive a restore is about to read from, and it preserves data a prune is
+/// about to delete. Returns `None` when there is nothing to save.
+pub fn safety_backup(paths: &Paths, app: &str, label: &str, src: &Path) -> Result<Option<PathBuf>> {
+    if !src.is_dir() {
+        return Ok(None);
+    }
+    let dest = paths
+        .backups
+        .join("safety")
+        .join(app)
+        .join(format!("{label}-{}.tar.gz", timestamp()));
+    tar_dir(src, &dest).with_context(|| format!("safety backup of {}", src.display()))?;
+    state::record_event(paths, app, &format!("safety backup: {}", dest.display()))?;
+    Ok(Some(dest))
+}
+
 /// Archive one named volume of an app into a gzip-compressed tarball. Returns
 /// the path written.
 pub fn backup_volume(cfg: &Config, paths: &Paths, app: &str, name: &str) -> Result<PathBuf> {
@@ -98,39 +180,40 @@ pub fn backup_volume(cfg: &Config, paths: &Paths, app: &str, name: &str) -> Resu
         src.display()
     );
     let dir = volume_backup_dir(paths, app, name);
-    std::fs::create_dir_all(&dir)?;
     let file = dir.join(format!("{}.tar.gz", timestamp()));
-    let file_str = file.to_string_lossy().into_owned();
-    let src_str = src.to_string_lossy().into_owned();
-    // tar the directory contents (`.`) so the archive restores cleanly into any
-    // target directory regardless of its name.
-    let script = format!("tar -C '{src_str}' -czf '{file_str}' .");
-    proc::shell(&script).with_context(|| format!("backing up volume {app}/{name}"))?;
-    state::record_event(paths, app, &format!("volume `{name}` backup: {file_str}"))?;
+    tar_dir(&src, &file).with_context(|| format!("backing up volume {app}/{name}"))?;
+    state::record_event(
+        paths,
+        app,
+        &format!("volume `{name}` backup: {}", file.display()),
+    )?;
     apply_retention(&dir, cfg)?;
     Ok(file)
 }
 
-/// Back up every volume of one app. Returns the paths written.
+/// Back up every *existing* volume of one app. Volumes that have no data dir yet
+/// (the app never started, or the volume was just declared) are skipped rather
+/// than aborting the whole command. Returns the paths written.
 pub fn backup_app_volumes(cfg: &Config, paths: &Paths, app: &str) -> Result<Vec<PathBuf>> {
-    let volumes = cfg
+    let app_cfg = cfg
         .apps
         .get(app)
-        .ok_or_else(|| anyhow::anyhow!("unknown app `{app}`"))?
-        .volumes
-        .clone();
+        .ok_or_else(|| anyhow::anyhow!("unknown app `{app}`"))?;
     let mut out = Vec::new();
-    for name in volumes.keys() {
-        out.push(backup_volume(cfg, paths, app, name)?);
+    for name in app_cfg.volumes.keys() {
+        if paths.volume_dir(app, name).is_dir() {
+            out.push(backup_volume(cfg, paths, app, name)?);
+        }
     }
     Ok(out)
 }
 
 /// Restore one app volume from a tarball. Destructive: it clears the live data
 /// directory and extracts the archive over it. Always takes a safety backup of
-/// the current contents first, and stops the app container so nothing writes
-/// mid-restore. The next reconcile (timer or `homeops reconcile`) brings the
-/// app back up against the restored data.
+/// the current contents first (into the un-pruned `safety/` tree, so it can
+/// never evict the source archive), stops the app container so nothing writes
+/// mid-restore, and re-applies the volume's permissions so a non-root container
+/// can still write. The next reconcile brings the app back up.
 pub fn restore_volume(
     cfg: &Config,
     paths: &Paths,
@@ -143,33 +226,26 @@ pub fn restore_volume(
     anyhow::ensure!(size > 0, "backup file is empty: {}", file.display());
 
     let src = paths.volume_dir(app, name);
-    if src.is_dir() {
-        let safety =
-            backup_volume(cfg, paths, app, name).context("taking safety backup before restore")?;
-        state::record_event(
-            paths,
-            app,
-            &format!("volume safety backup: {}", safety.display()),
-        )?;
-    } else {
-        std::fs::create_dir_all(&src)?;
-    }
+    // Safety backup of current data (if any) before we clobber it.
+    safety_backup(paths, app, name, &src).context("taking safety backup before restore")?;
 
     // Stop the app so nothing writes to the directory during extraction.
-    let container = docker::container_name(app);
-    docker::remove(&container)?;
+    docker::remove(&docker::container_name(app))?;
 
-    let src_str = src.to_string_lossy().into_owned();
-    let file_str = file.to_string_lossy().into_owned();
-    // Clear existing contents (without removing the mount target itself), then
-    // extract. `find -mindepth 1 -delete` is a no-op on an empty directory.
-    let script =
-        format!("find '{src_str}' -mindepth 1 -delete && tar -C '{src_str}' -xzf '{file_str}'");
-    proc::shell(&script).with_context(|| format!("restoring volume {app}/{name}"))?;
+    std::fs::create_dir_all(&src)?;
+    clear_dir(&src).with_context(|| format!("clearing {}", src.display()))?;
+    untar_into(file, &src).with_context(|| format!("restoring volume {app}/{name}"))?;
+
+    // Re-apply the volume's permissions: the freshly cleared dir must end up as
+    // writable as a reconciled one (uid-owned or world-writable), or a non-root
+    // container would fail to write to its restored data.
+    let spec = cfg.apps.get(app).and_then(|a| a.volumes.get(name));
+    crate::storage::apply_dir_perms(&src, spec)?;
+
     state::record_event(
         paths,
         app,
-        &format!("volume `{name}` restored from {file_str}"),
+        &format!("volume `{name}` restored from {}", file.display()),
     )?;
     Ok(())
 }

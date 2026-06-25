@@ -7,7 +7,6 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 /// What reconcile would (or did) do for a single app.
@@ -206,18 +205,7 @@ fn resolve_volumes(
         if !host.exists() {
             std::fs::create_dir_all(&host)
                 .with_context(|| format!("creating volume dir {}", host.display()))?;
-            match spec.uid() {
-                Some(uid) => {
-                    std::os::unix::fs::chown(&host, Some(uid), Some(uid))
-                        .with_context(|| format!("chowning {} to uid {uid}", host.display()))?;
-                    std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755))
-                        .with_context(|| format!("setting permissions on {}", host.display()))?;
-                }
-                None => {
-                    std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o777))
-                        .with_context(|| format!("setting permissions on {}", host.display()))?;
-                }
-            }
+            crate::storage::apply_dir_perms(&host, Some(spec))?;
         }
         out.push(docker::VolumeMount {
             host: host.to_string_lossy().into_owned(),
