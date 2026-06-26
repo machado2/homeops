@@ -174,6 +174,11 @@ pub struct Config {
     pub caddy: CaddyConfig,
     #[serde(default)]
     pub apps: BTreeMap<String, AppConfig>,
+    /// Workloads that run as systemd services on the host instead of containers,
+    /// because they need native Docker access a HomeOps container never gets
+    /// (the motivating case is StackBench, whose panel drives `docker compose`).
+    #[serde(default)]
+    pub host_services: BTreeMap<String, HostServiceConfig>,
 }
 
 impl Config {
@@ -194,8 +199,13 @@ impl Config {
         if let Some(d) = &admin_domain {
             seen.insert(d.clone(), "<admin>".to_string());
         }
+        // Apps and host services share one identity namespace: both become a
+        // `<workdir>/checkouts/<name>` path, a `<name>.json` state file and a
+        // routed domain set, so a name used by both would collide.
+        let mut names: BTreeMap<String, &'static str> = BTreeMap::new();
         for (name, app) in &self.apps {
             validate_app_name(name)?;
+            names.insert(name.clone(), "app");
             for domain in &app.domains {
                 let key = domain.to_lowercase();
                 if let Some(prev) = seen.get(&key) {
@@ -205,8 +215,54 @@ impl Config {
             }
             validate_volumes(name, app)?;
         }
+        for (name, svc) in &self.host_services {
+            validate_app_name(name)?;
+            if names.contains_key(name) {
+                anyhow::bail!("`{name}` is declared as both an app and a host_service");
+            }
+            for domain in &svc.domains {
+                let key = domain.to_lowercase();
+                if let Some(prev) = seen.get(&key) {
+                    anyhow::bail!("domain `{domain}` is claimed by both `{prev}` and `{name}`");
+                }
+                seen.insert(key, name.clone());
+            }
+            validate_host_service(name, svc)?;
+        }
         Ok(())
     }
+}
+
+/// A host service runs a systemd unit as a dedicated user and is routed to a
+/// fixed loopback port. Reject anything that would produce an unusable unit or
+/// collide with the app port pool.
+fn validate_host_service(name: &str, svc: &HostServiceConfig) -> Result<()> {
+    let valid_user = !svc.run_as.is_empty()
+        && svc
+            .run_as
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !valid_user {
+        anyhow::bail!(
+            "host_service `{name}`: invalid run_as user `{}`",
+            svc.run_as
+        );
+    }
+    if svc.exec.trim().is_empty() {
+        anyhow::bail!("host_service `{name}`: `exec` (entrypoint script) is required");
+    }
+    if svc.port == 0 {
+        anyhow::bail!("host_service `{name}`: `port` must be non-zero");
+    }
+    // Apps are auto-assigned ports in this range; a host service binding here
+    // could clash with a container publish.
+    if (PORT_RANGE_START..=PORT_RANGE_END).contains(&svc.port) {
+        anyhow::bail!(
+            "host_service `{name}`: `port` {} is inside the app range {PORT_RANGE_START}-{PORT_RANGE_END}; pick another",
+            svc.port
+        );
+    }
+    Ok(())
 }
 
 /// An app name is used verbatim as a host path component (checkouts, state,
@@ -525,6 +581,83 @@ impl AppConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Host service config
+// ---------------------------------------------------------------------------
+
+/// A workload HomeOps runs as a **systemd unit on the host**, not as a
+/// container. Use this only for things that genuinely need host-level Docker
+/// access (the panel of StackBench shells out `docker compose`), which a
+/// HomeOps container is never granted. HomeOps still owns its lifecycle from
+/// git: it clones the repo, runs an idempotent `setup` script, renders the unit
+/// running as `run_as`, and routes the service's domains to its loopback port.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HostServiceConfig {
+    /// Git URL of the service repo.
+    pub repo: String,
+    /// Branch, tag, or commit. Omit to follow the master/main convention.
+    #[serde(default)]
+    pub r#ref: Option<String>,
+    /// Optional explicit tracking mode: `branch` or `fixed`. Inferred when absent.
+    #[serde(default)]
+    pub tracking: Option<String>,
+    /// System user the unit runs as. Created (in the `docker` group) if missing,
+    /// so the service reaches the Docker socket without privilege escalation.
+    pub run_as: String,
+    /// Idempotent provisioning script, relative to the checkout root (e.g.
+    /// `deploy/setup.sh`). Run by HomeOps as root on every source change, with
+    /// `HOMEOPS_SERVICE_USER=<run_as>` in the environment.
+    #[serde(default)]
+    pub setup: Option<String>,
+    /// Service entrypoint, relative to the checkout root (e.g. `deploy/run.sh`).
+    /// Becomes the unit's `ExecStart`.
+    pub exec: String,
+    /// Loopback port the service binds; the proxy and Caddy route to it.
+    pub port: u16,
+    /// Domains routed to this service.
+    #[serde(default)]
+    pub domains: Vec<String>,
+    /// Environment variables for the unit, declared inline. HomeOps writes them
+    /// to a root-only `EnvironmentFile`, so secrets never land in the unit text.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Plaintext HTTP basic-auth password protecting this service's domains.
+    #[serde(default)]
+    pub pass: Option<String>,
+    /// Basic-auth username. Defaults to `admin` when a `pass` is set.
+    #[serde(default)]
+    pub user: Option<String>,
+}
+
+impl HostServiceConfig {
+    /// Whether HomeOps should follow new commits on the ref. Same convention as
+    /// [`AppConfig::tracks_branch`].
+    pub fn tracks_branch(&self) -> bool {
+        match self.tracking.as_deref() {
+            Some("branch") => true,
+            Some("fixed") => false,
+            _ => {
+                let Some(r) = &self.r#ref else {
+                    return true;
+                };
+                let is_sha =
+                    r.len() >= 7 && r.len() <= 40 && r.chars().all(|c| c.is_ascii_hexdigit());
+                let is_tag =
+                    r.starts_with('v') && r[1..].chars().next().is_some_and(|c| c.is_ascii_digit());
+                !(is_sha || is_tag)
+            }
+        }
+    }
+
+    /// Basic-auth credentials guarding this service's domains, if a password is
+    /// set. The username defaults to `admin`.
+    pub fn basic_auth(&self) -> Option<(String, String)> {
+        let pass = self.pass.as_ref()?;
+        let user = self.user.as_deref().unwrap_or("admin");
+        Some((user.to_string(), pass.clone()))
+    }
+}
+
 /// How a single volume mounts. Accepts either a bare mount path
 /// (`data = "/data"`) or a record with options
 /// (`data = { path = "/data", read_only = true, uid = 1000 }`). The bare-string
@@ -815,6 +948,67 @@ mod tests {
                  } }"#,
         );
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn host_service_parses_and_validates() {
+        let cfg = config(
+            r#"{ host_services = {
+                   sb = { repo = "x", run_as = "sb", exec = "deploy/run.sh", port = 8077,
+                          domains = ["sb.example.com"], env = { K = "v" } },
+                 } }"#,
+        );
+        cfg.validate().expect("valid host service");
+        let svc = &cfg.host_services["sb"];
+        assert_eq!(svc.run_as, "sb");
+        assert_eq!(svc.port, 8077);
+        assert_eq!(svc.basic_auth(), None);
+        assert!(svc.tracks_branch()); // no ref → branch
+    }
+
+    #[test]
+    fn host_service_pass_yields_basic_auth() {
+        let cfg = config(
+            r#"{ host_services = { sb = { repo = "x", run_as = "sb", exec = "r", port = 8077, pass = "s3cr3t" } } }"#,
+        );
+        assert_eq!(
+            cfg.host_services["sb"].basic_auth(),
+            Some(("admin".into(), "s3cr3t".into()))
+        );
+    }
+
+    #[test]
+    fn host_service_domain_clashing_with_app_is_rejected() {
+        let cfg = config(
+            r#"{ apps = { a = { repo = "x", domains = ["dup.example.com"] } },
+                 host_services = { sb = { repo = "y", run_as = "sb", exec = "r", port = 8077, domains = ["dup.example.com"] } } }"#,
+        );
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn name_used_by_app_and_host_service_is_rejected() {
+        let cfg = config(
+            r#"{ apps = { sb = { repo = "x" } },
+                 host_services = { sb = { repo = "y", run_as = "sb", exec = "r", port = 8077 } } }"#,
+        );
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn host_service_port_in_app_range_is_rejected() {
+        let cfg = config(
+            r#"{ host_services = { sb = { repo = "x", run_as = "sb", exec = "r", port = 41500 } } }"#,
+        );
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn host_service_empty_exec_is_rejected() {
+        let cfg = config(
+            r#"{ host_services = { sb = { repo = "x", run_as = "sb", exec = "", port = 8077 } } }"#,
+        );
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

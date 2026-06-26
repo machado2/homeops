@@ -67,6 +67,55 @@ To be compatible with HomeOps v1, an app must:
 7. Keep uploads and persistent files in a declared `volume` or outside the
    container (S3/R2/etc.).
 
+### Host services (when an app can't be a container)
+
+Some workloads genuinely need **native Docker access** — they shell out to
+`docker`/`docker compose` themselves. A HomeOps *container* is never given that
+(no socket mount, no `--privileged`, no host networking, no raw docker args), so
+such a workload cannot be an app. The motivating case is
+[StackBench](https://github.com/machado2/stackbench), whose web panel launches
+`inspect eval`, which drives `docker compose` to build and run sandbox
+containers.
+
+For these, declare a **`host_service`** instead of an app. HomeOps still owns it
+from git, but renders a **systemd unit on the host** rather than running a
+container:
+
+```nickel
+host_services = {
+  stackbench = {
+    repo    = "git@github.com:machado2/stackbench.git",
+    # `ref` optional — same master/main convention as apps.
+    run_as  = "stackbench",          # system user the unit runs as (created, in the `docker` group)
+    setup   = "deploy/setup.sh",     # idempotent provisioning, re-run on every source change
+    exec    = "deploy/run.sh",       # the unit's ExecStart
+    port    = 8077,                  # fixed loopback port the service binds
+    domains = ["stackbench.example.com"],
+    env     = { STACKBENCH_LLM_BASE_URL = "https://llm.example.com/v1" },
+    pass    = "tomate1234",          # optional basic auth, like apps
+  },
+}
+```
+
+Each reconcile: sync the repo; ensure `run_as` exists and is in the `docker`
+group; write a root-only `EnvironmentFile` from `env`; on a source change run
+`setup` (as root, with `HOMEOPS_SERVICE_USER=<run_as>` set); render
+`/etc/systemd/system/homeops-<name>.service`; then `daemon-reload`, `enable` and
+`restart`. The service's domains are routed exactly like an app's (Caddy
+generation + the HomeOps proxy), but the proxy upstream is the fixed
+`127.0.0.1:<port>` instead of an allocated container port.
+
+**Host-service contract.** The repo must provide an `exec` script that runs the
+process in the foreground bound to `127.0.0.1:<port>`, and (optionally) an
+idempotent `setup` script. Apps and host services share one name namespace and
+one domain namespace (both validated unique).
+
+**Privileges.** Rendering units and provisioning the host need root — the same
+root the `homeops-reconcile` service already runs as. Host services do not
+broaden reconcile's privileges; they use the root it already has. If you run
+reconcile unprivileged (e.g. local testing), the units are written but won't
+start, which is the honest outcome.
+
 ## Install
 
 On a freshly formatted Linux server with Docker available:
@@ -236,9 +285,15 @@ volumes = {
   built-in proxy routes by normalized `Host` header, sets `X-Forwarded-*`,
   streams bodies and tunnels WebSocket upgrades. TLS is expected to be terminated
   upstream (Caddy/Cloudflare/etc.).
+- **Host services.** Workloads needing native Docker access run as systemd units
+  on the host (`homeops-<name>.service`) instead of containers. Reconcile syncs
+  the repo, runs an idempotent `setup` on source change, renders the unit
+  (running as a dedicated user with a root-only `EnvironmentFile`) and
+  restarts it; the proxy routes their domains to a fixed loopback port. See
+  [Host services](#host-services-when-an-app-cant-be-a-container).
 - **Caddy (optional).** `caddy.mode` can be `off` (default), `fragment` (writes a
   snippet you `import`), or `full` (only overwrites a file carrying the
-  `# managed-by: homeops` marker).
+  `# managed-by: homeops` marker). App and host-service domains are both emitted.
 - **Databases.** Postgres/MySQL run as managed containers with a single admin
   user; HomeOps creates per-app databases and injects the connection string.
 
@@ -265,6 +320,8 @@ CI builds and checks the project on Linux on every push (see
 - **v0.6** optional Caddy management with an ownership marker and reload.
 - **v0.7** managed per-app volumes (host-backed) with `read_only`/`uid` options,
   tar backup/restore, orphan detection (`doctor`) and `volume-prune`.
+- **v0.8** host services: GitOps-managed systemd units for workloads that need
+  native Docker access (e.g. StackBench), routed like apps.
 - **Later** workers, cron, Compose, Podman, webhooks, config editing via PR,
   multi-server.
 

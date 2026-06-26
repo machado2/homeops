@@ -7,7 +7,7 @@
 //! * the **admin UI** (e.g. `127.0.0.1:9090`), which shows status and exposes a
 //!   few operational actions (deploy now, backup now).
 
-use crate::config::{AdminConfig, AppConfig, Config, Paths};
+use crate::config::{AdminConfig, AppConfig, Config, HostServiceConfig, Paths};
 use crate::state::{self, AppState};
 use crate::{backup, docker, reconcile};
 use anyhow::{Context, Result};
@@ -131,6 +131,14 @@ fn resolve_app<'a>(ctx: &'a Ctx, host: &str) -> Option<(&'a String, &'a AppConfi
         .find(|(_, app)| app.domains.iter().any(|d| d.eq_ignore_ascii_case(host)))
 }
 
+/// Find the host service whose domains include `host`.
+fn resolve_host_service<'a>(ctx: &'a Ctx, host: &str) -> Option<&'a HostServiceConfig> {
+    ctx.config
+        .host_services
+        .values()
+        .find(|svc| svc.domains.iter().any(|d| d.eq_ignore_ascii_case(host)))
+}
+
 /// Check HTTP basic-auth credentials against a plaintext `user`/`pass`.
 fn basic_auth_ok(req: &Request<Incoming>, user: &str, pass: &str) -> bool {
     let expected = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
@@ -160,17 +168,12 @@ async fn handle_proxy(
     };
 
     // Admin domain → admin listener (the admin UI enforces its own auth).
+    // Then apps (container, port from state), then host services (systemd unit,
+    // fixed port from config). Basic auth is checked before any upgrade handling
+    // so websockets are protected too.
     let upstream = if ctx.admin_domain.as_deref() == Some(host.as_str()) {
         ctx.admin_upstream.clone()
-    } else {
-        let Some((name, app)) = resolve_app(&ctx, &host) else {
-            return Ok(status(
-                StatusCode::NOT_FOUND,
-                &format!("no app routed for host `{host}`"),
-            ));
-        };
-        // Gate the app behind basic auth when a password is configured. Done
-        // before any upgrade handling so websockets are protected too.
+    } else if let Some((name, app)) = resolve_app(&ctx, &host) {
         if let Some((user, pass)) = app.basic_auth() {
             if !basic_auth_ok(&req, &user, &pass) {
                 return Ok(auth_challenge(&host));
@@ -188,6 +191,18 @@ async fn handle_proxy(
                 ))
             }
         }
+    } else if let Some(svc) = resolve_host_service(&ctx, &host) {
+        if let Some((user, pass)) = svc.basic_auth() {
+            if !basic_auth_ok(&req, &user, &pass) {
+                return Ok(auth_challenge(&host));
+            }
+        }
+        format!("127.0.0.1:{}", svc.port)
+    } else {
+        return Ok(status(
+            StatusCode::NOT_FOUND,
+            &format!("no app routed for host `{host}`"),
+        ));
     };
 
     // WebSocket / other protocol upgrades → raw bidirectional tunnel.

@@ -9,6 +9,7 @@ mod databases;
 mod docker;
 mod doctor;
 mod git;
+mod host_service;
 mod proc;
 mod reconcile;
 mod serve;

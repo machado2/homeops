@@ -165,6 +165,25 @@ pub fn uninstall(paths: &Paths, purge: bool) -> Result<()> {
         }
         let _ = std::fs::remove_file(file);
     }
+
+    // Host-service units are written by reconcile, not install, so they are not
+    // in the manifest. Disable and remove any `homeops-<name>.service` that is
+    // not one of the core units handled above.
+    let core = ["homeops-web.service", "homeops-reconcile.service"];
+    if let Ok(entries) = std::fs::read_dir(SYSTEMD_DIR) {
+        for entry in entries.flatten() {
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            if fname.starts_with("homeops-")
+                && fname.ends_with(".service")
+                && !core.contains(&fname.as_str())
+            {
+                let _ = proc::run("systemctl", &["disable", "--now", &fname]);
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all("/etc/homeops/host-services");
+
     let _ = proc::run("systemctl", &["daemon-reload"]);
 
     if purge {

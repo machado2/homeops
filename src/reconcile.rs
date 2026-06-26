@@ -54,19 +54,33 @@ pub fn reconcile_all(cfg: &Config, paths: &Paths) -> Result<Vec<(String, Action)
     for (name, app) in &cfg.apps {
         let action = match reconcile_app(cfg, paths, name, app) {
             Ok(a) => a,
-            Err(e) => {
-                let msg = e.to_string();
-                state::record_event(paths, name, &format!("reconcile error: {msg}")).ok();
-                let mut st = AppState::load(paths, name).unwrap_or_default();
-                st.app = name.clone();
-                st.last_error = Some(msg.clone());
-                st.save(paths).ok();
-                Action::Failed(msg)
-            }
+            Err(e) => record_failure(paths, name, e),
+        };
+        results.push((name.clone(), action));
+    }
+    // Host services: GitOps-managed systemd units for workloads that need native
+    // Docker access. They share the apps' state/event machinery and identity
+    // namespace (validated unique), so they slot into the same results vec.
+    for (name, svc) in &cfg.host_services {
+        let action = match crate::host_service::reconcile_one(paths, name, svc) {
+            Ok(a) => a,
+            Err(e) => record_failure(paths, name, e),
         };
         results.push((name.clone(), action));
     }
     Ok(results)
+}
+
+/// Persist a reconcile error onto an app/host-service's state + timeline and map
+/// it to a [`Action::Failed`].
+fn record_failure(paths: &Paths, name: &str, e: anyhow::Error) -> Action {
+    let msg = e.to_string();
+    state::record_event(paths, name, &format!("reconcile error: {msg}")).ok();
+    let mut st = AppState::load(paths, name).unwrap_or_default();
+    st.app = name.to_string();
+    st.last_error = Some(msg.clone());
+    st.save(paths).ok();
+    Action::Failed(msg)
 }
 
 fn reconcile_app(cfg: &Config, paths: &Paths, name: &str, app: &AppConfig) -> Result<Action> {
@@ -285,7 +299,44 @@ pub fn plan(cfg: &Config, paths: &Paths) -> Vec<(String, PlanEntry)> {
     for (name, app) in &cfg.apps {
         out.push((name.clone(), plan_app(paths, name, app)));
     }
+    for (name, svc) in &cfg.host_services {
+        out.push((name.clone(), plan_host_service(paths, name, svc)));
+    }
     out
+}
+
+fn plan_host_service(
+    paths: &Paths,
+    name: &str,
+    svc: &crate::config::HostServiceConfig,
+) -> PlanEntry {
+    let st = AppState::load(paths, name).unwrap_or_default();
+    let remote = git::resolve_ref(&svc.repo, svc.r#ref.as_deref())
+        .ok()
+        .and_then(|r| git::remote_commit(&svc.repo, &r));
+    let cfg_hash = crate::host_service::config_hash(svc);
+    let config_changed = st.last_config_hash.as_deref() != Some(cfg_hash.as_str());
+
+    let commit_change = match (&st.last_deployed_commit, &remote) {
+        (Some(old), Some(new)) if old != new => Some((short(old), short(new))),
+        (None, Some(new)) => Some(("none".into(), short(new))),
+        _ => None,
+    };
+
+    let active = crate::host_service::is_active(name);
+    let action = if commit_change.is_some() || !active {
+        Action::RebuildRestart
+    } else if config_changed {
+        Action::Restart
+    } else {
+        Action::NoChange
+    };
+
+    PlanEntry {
+        commit_change,
+        config_changed,
+        action,
+    }
 }
 
 #[derive(Debug, Clone)]

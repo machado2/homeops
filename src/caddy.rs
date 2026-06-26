@@ -12,6 +12,9 @@ use std::path::Path;
 fn render_sites(cfg: &Config, proxy_target: &str) -> String {
     let mut out = String::new();
     let mut domains: Vec<String> = cfg.apps.values().flat_map(|a| a.domains.clone()).collect();
+    // Host services route through the same HomeOps proxy as apps; their domains
+    // must appear here too or `full` mode would drop them.
+    domains.extend(cfg.host_services.values().flat_map(|s| s.domains.clone()));
     if let Some(d) = &cfg.proxy.admin_domain {
         domains.push(d.clone());
     }

@@ -75,4 +75,24 @@ in
       healthcheck = { path = "/health", timeout_seconds = 10, interval_seconds = 5, retries = 5 },
     },
   },
+
+  # Host services: workloads that need native Docker access (they shell out to
+  # `docker`/`docker compose` themselves), which a HomeOps *container* never
+  # gets. HomeOps still manages them from git, but renders a systemd unit on the
+  # host instead of running a container. Use this sparingly — apps are the norm.
+  host_services = {
+    # Example: StackBench's panel launches `inspect eval`, which drives
+    # `docker compose` to build/run sandbox containers.
+    stackbench = {
+      repo    = "git@github.com:machado2/stackbench.git",
+      # `ref` optional — same master/main convention as apps.
+      run_as  = "stackbench",          # system user the unit runs as (created, added to `docker`)
+      setup   = "deploy/setup.sh",     # idempotent provisioning; re-run on every source change
+      exec    = "deploy/run.sh",       # the unit's ExecStart (must bind 127.0.0.1:<port>)
+      port    = 8077,                  # fixed loopback port the proxy/Caddy route to
+      domains = ["stackbench.example.com"],
+      env     = { STACKBENCH_LLM_BASE_URL = "https://llm.example.com/v1" },
+      pass    = "tomate1234",          # optional basic auth, like apps
+    },
+  },
 }
